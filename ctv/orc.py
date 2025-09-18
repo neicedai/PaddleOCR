@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GPU 优先的本地 OCR HTTP 服务（PaddleOCR 2.7.x）
-- 优先使用 GPU（use_gpu=True），若 cuDNN/驱动不可用会自动回退到 CPU（可用 OCR_GPU_STRICT=1 禁止回退）
+GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
+- 优先使用 GPU（device="gpu"），若 cuDNN/驱动不可用会自动回退到 CPU（可用 OCR_GPU_STRICT=1 禁止回退）
 - 预热：启动时做一次小图推理以加载模型，避免首个请求卡顿
 - 路由：
     POST /ocr      { "image_b64": "<base64或dataURL>" } -> { ok, lines:[{text, score, box}], error? }
     GET  /healthz  -> { ok: true }
     GET  /version  -> { paddleocr, paddlepaddle, device, use_gpu, cls }
-- 依赖：fastapi uvicorn pillow numpy paddleocr（以及已装好的 paddlepaddle-gpu 2.6.x + cuDNN8）
+- 依赖：fastapi uvicorn pillow numpy paddleocr（以及已装好的 paddlepaddle-gpu 3.x + cuDNN8）
 建议：
     pip install -U fastapi uvicorn pillow numpy
-    pip install paddleocr==2.7.3
+    pip install paddleocr>=3.0.0
     pip install "paddlepaddle-gpu==2.6.1" -f https://www.paddlepaddle.org.cn/whl/cu121.html
 """
 
@@ -55,7 +55,7 @@ except Exception as e:
 # ================== 环境参数 ==================
 # 是否严格要求用 GPU（1=严格，不可回退；0/缺省=可回退）
 GPU_STRICT   = os.getenv("OCR_GPU_STRICT", "0") == "1"
-# 是否启用方向分类（cls），图像基本正向可关（0）以提速
+# 是否启用文本行方向分类，图像基本正向可关（0）以提速
 USE_CLS      = os.getenv("OCR_CLS", "0") == "1"     # 默认关，加速
 # 端口
 PORT         = int(os.getenv("OCR_PORT", "8001"))
@@ -72,13 +72,16 @@ def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
     # 优先尝试 GPU
     if PREF_DEV.startswith("gpu") or PREF_DEV == "auto":
         try:
-            print("[INIT] Try GPU (use_gpu=True)...", file=sys.stderr, flush=True)
+            gpu_device = "gpu" if PREF_DEV == "auto" else PREF_DEV
+            print(f"[INIT] Try GPU (device={gpu_device})...", file=sys.stderr, flush=True)
             ocr = PaddleOCR(
                 lang="ch",
-                use_angle_cls=USE_CLS,
-                use_gpu=True,                      # GPU
-                det_limit_side_len=DET_MAX_SIDE,
-                rec_batch_num=REC_BATCH
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=USE_CLS,
+                text_det_limit_side_len=DET_MAX_SIDE,
+                text_recognition_batch_size=REC_BATCH,
+                device=gpu_device,
             )
             # 做一次 tiny 预热确认可用（可捕获 cuDNN/驱动异常）
             _warmup_once(ocr, USE_CLS)
@@ -92,13 +95,15 @@ def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
                 raise
 
     # 回退 CPU
-    print("[INIT] Fallback to CPU (use_gpu=False)...", file=sys.stderr, flush=True)
+    print("[INIT] Fallback to CPU (device=cpu)...", file=sys.stderr, flush=True)
     ocr = PaddleOCR(
         lang="ch",
-        use_angle_cls=USE_CLS,
-        use_gpu=False,                     # CPU
-        det_limit_side_len=DET_MAX_SIDE,
-        rec_batch_num=max(16, min(REC_BATCH, 64))  # CPU 上自然调小些
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=USE_CLS,
+        text_det_limit_side_len=DET_MAX_SIDE,
+        text_recognition_batch_size=max(16, min(REC_BATCH, 64)),
+        device="cpu",
     )
     _warmup_once(ocr, USE_CLS)
     print("[INIT] CPU OK.", file=sys.stderr, flush=True)
@@ -112,7 +117,7 @@ def _warmup_once(ocr: PaddleOCR, use_cls: bool):
         d.text((10, 60), "你好，OCR", fill=(0, 0, 0))
         arr = np.array(img)
         t0 = time.time()
-        _ = ocr.ocr(arr, cls=use_cls)
+        _ = ocr.predict(arr, use_textline_orientation=use_cls)
         dt = time.time() - t0
         print(f"[WARMUP] done in {dt:.2f}s (cls={use_cls})", file=sys.stderr, flush=True)
     except Exception as e:
@@ -121,7 +126,7 @@ def _warmup_once(ocr: PaddleOCR, use_cls: bool):
 ocr, USING_GPU = init_ocr_prefer_gpu()
 
 # ================== FastAPI 层 ==================
-app = FastAPI(title="Local OCR Service (GPU-first, PaddleOCR 2.7.x)")
+app = FastAPI(title="Local OCR Service (GPU-first, PaddleOCR 3.x)")
 
 class OcrReq(BaseModel):
     image_b64: str  # 支持纯 base64 或 dataURL（data:image/...;base64,xxxx）
@@ -175,18 +180,46 @@ def do_ocr(req: OcrReq):
         img = _read_image_from_b64(req.image_b64)
         arr = np.array(img)  # HWC, RGB
         t0 = time.time()
-        result = ocr.ocr(arr, cls=USE_CLS)
+        result = ocr.predict(arr, use_textline_orientation=USE_CLS)
         dt = time.time() - t0
         print(f"[REQ] one image OK in {dt:.2f}s | device={'GPU' if USING_GPU else 'CPU'} | cls={USE_CLS}",
               file=sys.stderr, flush=True)
 
         lines: List[Dict[str, Any]] = []
         if result:
-            blocks = result[0] if isinstance(result[0], list) else result
-            for det in blocks:
-                box = det[0]
-                txt, score = det[1]
-                lines.append({"text": txt, "score": float(score), "box": box})
+            for res in result:
+                data = res
+                if isinstance(data, dict) and "res" in data:
+                    data = data["res"]
+                elif hasattr(data, "res"):
+                    data = data.res
+                if not hasattr(data, "get") and hasattr(data, "items"):
+                    data = dict(data)
+                texts = data.get("rec_texts") or []
+                scores = data.get("rec_scores") or []
+                boxes = (
+                    data.get("rec_polys")
+                    or data.get("rec_boxes")
+                    or data.get("dt_polys")
+                    or []
+                )
+
+                for idx, text in enumerate(texts):
+                    if not text or not text.strip():
+                        continue
+                    score = float(scores[idx]) if idx < len(scores) else 0.0
+                    box = None
+                    if isinstance(boxes, (list, tuple)) and idx < len(boxes):
+                        box = boxes[idx]
+                    elif (
+                        hasattr(boxes, "__getitem__")
+                        and hasattr(boxes, "__len__")
+                        and idx < len(boxes)
+                    ):
+                        box = boxes[idx]
+                    if box is not None:
+                        box = np.asarray(box).tolist()
+                    lines.append({"text": text.strip(), "score": score, "box": box})
         return OcrResp(ok=True, lines=[OcrLine(**l) for l in lines])
     except Exception as e:
         err = str(e)
