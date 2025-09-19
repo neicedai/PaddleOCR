@@ -282,55 +282,56 @@ def _read_image_from_b64(b64: str) -> Image.Image:
         return img
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
-def _locate_bottom_text_region(arr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    """粗略估计图像中底部文字块的矩形区域."""
+def _cluster_bottom_text_entries(
+    entries: List[Tuple[int, np.ndarray]], image_height: int
+) -> Optional[List[int]]:
+    """基于检测框的纵向位置，将最底部的一段文字行聚为一个簇.
 
-    if arr.ndim != 3 or arr.shape[2] < 3:
+    返回属于底部簇的 entry 索引列表，若无法确定则返回 ``None``。
+    """
+
+    if not entries or image_height <= 0:
         return None
 
-    h, w = arr.shape[:2]
-    if h < 10 or w < 10:
+    # 收集每个文本框的 (top_y, bottom_y) 范围，并按照 top_y 升序排序
+    spans: List[Tuple[int, float, float]] = []
+    for idx, box in entries:
+        if box.size == 0:
+            continue
+        ys = box[..., 1].reshape(-1)
+        spans.append((idx, float(ys.min()), float(ys.max())))
+
+    if not spans:
         return None
 
-    # 灰度 -> 统计每行深色像素数量，估计文字分布
-    gray = np.dot(arr[..., :3], [0.299, 0.587, 0.114])
-    dark = gray < 200  # 允许老旧扫描件，阈值稍高
-    row_density = dark.sum(axis=1)
-    if not np.any(row_density):
-        return None
+    spans.sort(key=lambda item: item[1])
+    bottom_idx, bottom_top, bottom_bottom = spans[-1]
+    selected = {bottom_idx}
+    cluster_top = bottom_top
+    cluster_bottom = bottom_bottom
 
-    density_threshold = max(int(np.percentile(row_density, 80)), int(0.05 * w))
-    candidate_rows = np.where(row_density >= density_threshold)[0]
-    if candidate_rows.size == 0:
-        return None
-
-    # 聚焦于最底部的连通行段
-    bottom_row = candidate_rows[-1]
-    top_row = bottom_row
-    for idx in range(candidate_rows.size - 1, 0, -1):
-        if candidate_rows[idx] - candidate_rows[idx - 1] > 1:
+    # 从底部向上合并间隔较小的文本行，允许轻微的留白
+    gap_tolerance = max(image_height * 0.02, 8.0)
+    for idx, top, bottom in reversed(spans[:-1]):
+        if cluster_top - bottom > gap_tolerance:
             break
-        top_row = candidate_rows[idx - 1]
+        selected.add(idx)
+        cluster_top = min(cluster_top, top)
+        cluster_bottom = max(cluster_bottom, bottom)
 
-    top_row = max(0, top_row - int(0.02 * h))
-    bottom_row = min(h, bottom_row + int(0.02 * h) + 1)
-
-    col_slice = dark[top_row:bottom_row, :].sum(axis=0)
-    if not np.any(col_slice):
+    # 若聚合后的底部文本并不靠近图像底部，则认为判断不可靠
+    if cluster_bottom < image_height * 0.45:
         return None
 
-    col_threshold = max(int(np.percentile(col_slice, 70)), int(0.03 * h))
-    cols = np.where(col_slice >= col_threshold)[0]
-    if cols.size == 0:
-        return None
+    # 将所有与该纵向范围有重叠的行都纳入，避免遗漏同一文本块
+    for idx, top, bottom in spans:
+        if idx in selected:
+            continue
+        overlaps = not (bottom < cluster_top or top > cluster_bottom)
+        if overlaps:
+            selected.add(idx)
 
-    left_col = max(0, cols[0] - int(0.01 * w))
-    right_col = min(w, cols[-1] + int(0.01 * w) + 1)
-
-    if right_col - left_col < 5 or bottom_row - top_row < 5:
-        return None
-
-    return left_col, top_row, right_col, bottom_row
+    return sorted(selected)
 
 
 @app.post("/ocr", response_model=OcrResp)
@@ -339,26 +340,14 @@ def do_ocr(req: OcrReq):
         img = _read_image_from_b64(req.image_b64)
         arr = np.array(img)  # HWC, RGB
 
-        crop_box = _locate_bottom_text_region(arr)
-        if crop_box:
-            x0, y0, x1, y1 = crop_box
-            arr_for_ocr = arr[y0:y1, x0:x1]
-            print(
-                f"[CROP] bottom text region located at (x0={x0}, y0={y0}, x1={x1}, y1={y1})",
-                file=sys.stderr,
-                flush=True,
-            )
-        else:
-            arr_for_ocr = arr
-            x0 = y0 = 0
-
         t0 = time.time()
-        result = ocr.predict(arr_for_ocr, use_textline_orientation=USE_CLS)
+        result = ocr.predict(arr, use_textline_orientation=USE_CLS)
         dt = time.time() - t0
         print(f"[REQ] one image OK in {dt:.2f}s | device={'GPU' if USING_GPU else 'CPU'} | cls={USE_CLS}",
               file=sys.stderr, flush=True)
 
-        lines: List[Dict[str, Any]] = []
+        parsed_entries: List[Dict[str, Any]] = []
+        box_entries: List[Tuple[int, np.ndarray]] = []
         if result:
             for res in result:
                 data = res
@@ -381,48 +370,68 @@ def do_ocr(req: OcrReq):
                     if not text or not text.strip():
                         continue
                     text_clean = text.strip()
-                    converted = text_clean
-                    if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
-                        try:
-                            converted = _T2S_CONVERTER(text_clean)
-                        except Exception as exc:  # pragma: no cover - conversion failure shouldn't break OCR
-                            print(
-                                f"[REC][WARN] T2S convert failed: {exc}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                        else:
-                            print(
-                                f"[REC][T2S] '{text_clean}' -> '{converted}'",
-                                file=sys.stderr,
-                                flush=True,
-                            )
                     score = float(scores[idx]) if idx < len(scores) else 0.0
-                    box = None
+                    box_raw = None
                     if isinstance(boxes, (list, tuple)) and idx < len(boxes):
-                        box = boxes[idx]
+                        box_raw = boxes[idx]
                     elif (
                         hasattr(boxes, "__getitem__")
                         and hasattr(boxes, "__len__")
                         and idx < len(boxes)
                     ):
-                        box = boxes[idx]
-                    if box is not None:
-                        box_arr = np.asarray(box, dtype=float)
-                        if crop_box:
-                            offset = np.array([[x0, y0]], dtype=box_arr.dtype)
-                            if box_arr.ndim == 2:
-                                box_arr = box_arr + offset
-                            else:
-                                box_arr = box_arr + offset.reshape((-1, 1, 2))
-                        box = box_arr.tolist()
-                    final_text = converted
+                        box_raw = boxes[idx]
+                    box_arr = None
+                    if box_raw is not None:
+                        box_arr = np.asarray(box_raw, dtype=float)
+                        box_entries.append((len(parsed_entries), box_arr))
+                    parsed_entries.append({
+                        "raw_text": text_clean,
+                        "score": score,
+                        "box_arr": box_arr,
+                    })
+
+        selected_indices: Optional[List[int]] = None
+        if parsed_entries:
+            selected_indices = _cluster_bottom_text_entries(box_entries, arr.shape[0])
+            if selected_indices:
+                print(
+                    f"[CROP] focus bottom lines idx={selected_indices}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        lines: List[Dict[str, Any]] = []
+        indices_to_keep = selected_indices or list(range(len(parsed_entries)))
+        for idx in indices_to_keep:
+            entry = parsed_entries[idx]
+            text_clean = entry["raw_text"]
+            converted = text_clean
+            if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
+                try:
+                    converted = _T2S_CONVERTER(text_clean)
+                except Exception as exc:  # pragma: no cover
                     print(
-                        f"[REC] text='{final_text}' score={score:.4f}",
+                        f"[REC][WARN] T2S convert failed: {exc}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    lines.append({"text": final_text, "score": score, "box": box})
+                else:
+                    if converted != text_clean:
+                        print(
+                            f"[REC][T2S] '{text_clean}' -> '{converted}'",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+            score = entry["score"]
+            box_arr = entry["box_arr"]
+            box = box_arr.tolist() if box_arr is not None else None
+            final_text = converted
+            print(
+                f"[REC] text='{final_text}' score={score:.4f}",
+                file=sys.stderr,
+                flush=True,
+            )
+            lines.append({"text": final_text, "score": score, "box": box})
         return OcrResp(ok=True, lines=[OcrLine(**l) for l in lines])
     except Exception as e:
         err = str(e)
