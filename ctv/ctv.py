@@ -1312,22 +1312,25 @@ def main():
         print(f"输入路径不存在：{input_path}", file=sys.stderr)
         sys.exit(1)
     out_path = Path(args.out).expanduser().resolve()
-    pdf_image_root = out_path.parent / "_ctv_build" / "pdf_images"
-
-    images: List[Path] = []
-
-    def _convert_and_collect(pdf_file: Path) -> List[Path]:
+    def _convert_and_collect(pdf_file: Path, image_root: Path) -> List[Path]:
+        target_dir = image_root / pdf_file.stem
         print(f"[PDF] 开始转换：{pdf_file}")
         try:
-            converted = convert_pdf_to_images(pdf_file, pdf_image_root / pdf_file.stem)
+            converted = convert_pdf_to_images(pdf_file, target_dir)
         except ImportError:
             print("缺少 PyMuPDF，请先安装：pip install PyMuPDF", file=sys.stderr)
             sys.exit(1)
         except Exception as err:
             print(f"PDF 转图片失败：{pdf_file} -> {err}", file=sys.stderr)
             sys.exit(1)
-        print(f"[PDF] 转换完成：{pdf_file.name} -> {len(converted)} 张图片，输出目录：{pdf_image_root / pdf_file.stem}")
+        print(f"[PDF] 转换完成：{pdf_file.name} -> {len(converted)} 张图片，输出目录：{target_dir}")
         return converted
+
+    def _pdf_image_root_for(output_path: Path) -> Path:
+        base = output_path.parent if output_path.suffix else output_path
+        return base / "_ctv_build" / "pdf_images"
+
+    jobs: List[Tuple[List[Path], Path]] = []
 
     if input_path.is_dir():
         pdfs = list_pdfs_sorted(input_path)
@@ -1336,29 +1339,49 @@ def main():
             print(f"目录中同时包含 PDF 和 图片，请分开存放：{input_path}", file=sys.stderr)
             sys.exit(1)
         if pdfs:
-            print(f"[INPUT] 检测到 {len(pdfs)} 个 PDF 文件，准备转换为图片...")
-            for pdf_file in pdfs:
-                images.extend(_convert_and_collect(pdf_file))
+            total = len(pdfs)
+            print(f"[INPUT] 检测到 {total} 个 PDF 文件，准备转换为图片...")
+            if total == 1 and out_path.suffix:
+                pdf_file = pdfs[0]
+                output_target = out_path
+                images = _convert_and_collect(pdf_file, _pdf_image_root_for(output_target))
+                jobs.append((images, output_target))
+            else:
+                output_root = out_path if not out_path.suffix else out_path.parent
+                output_root.mkdir(parents=True, exist_ok=True)
+                for pdf_file in pdfs:
+                    output_target = output_root / f"{pdf_file.stem}.mp4"
+                    images = _convert_and_collect(pdf_file, _pdf_image_root_for(output_target))
+                    jobs.append((images, output_target))
         else:
             images = image_files
             print(f"[INPUT] 检测到 {len(images)} 张图片：{input_path}")
+            if images:
+                jobs.append((images, out_path))
     else:
         suffix = input_path.suffix.lower()
         if suffix == ".pdf":
             print("[INPUT] 检测到 PDF 文件，准备转换为图片...")
-            images = _convert_and_collect(input_path)
+            output_target = out_path if out_path.suffix else (out_path / f"{input_path.stem}.mp4")
+            images = _convert_and_collect(input_path, _pdf_image_root_for(output_target))
+            jobs.append((images, output_target))
         elif suffix in IMAGE_EXTS:
             images = [input_path]
             print(f"[INPUT] 使用单张图片：{input_path}")
+            jobs.append((images, out_path))
         else:
             print(f"不支持的输入文件类型：{input_path}", file=sys.stderr)
             sys.exit(1)
 
-    if not images:
+    if not jobs:
         print(f"未找到可处理的图片：{input_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[INPUT] 总计 {len(images)} 张图片待处理。")
+    if len(jobs) == 1:
+        print(f"[INPUT] 总计 {len(jobs[0][0])} 张图片待处理。")
+    else:
+        total_pages = sum(len(imgs) for imgs, _ in jobs)
+        print(f"[INPUT] 计划处理 {len(jobs)} 个 PDF，共 {total_pages} 张图片。")
 
     # 选择 OCR / TTS
     ocr_engine = pick_engine(args.ocr_engine, "OCR_VENDOR", "tencent",
@@ -1528,52 +1551,55 @@ def main():
         filter_keywords_value = os.getenv("FILTER_KEYWORDS", default_filter_keywords)
     filter_keywords_tuple = tuple([kw.strip() for kw in filter_keywords_value.replace("\n", ",").split(",") if kw.strip()])
 
-    build_video(
-        images=images,
-        out_path=out_path,
-        ocr_engine=ocr_engine,
-        lang_ocr=args.lang,
-        ocr_psm=args.ocr_psm,
-        ocr_oem=args.ocr_oem,
-        ocr_crop=ocr_crop,
-        strip_border=args.strip_border,
-        ocr_scale=args.scale,
-        binarize=not args.no_binarize,
-        tencent_model=tencent_model,
-        tts_engine=tts_engine,
-        edge_voice=edge_voice, edge_rate=edge_rate, edge_pitch=edge_pitch, edge_style=edge_style,
-        azure_voice=azure_voice, azure_rate=azure_rate, azure_pitch=azure_pitch, azure_style=azure_style,
-        eleven_voice_id=eleven_voice_id,
-        voice_lang=voice_lang, voice_name=voice_name,
-        chatts_url=chatts_url, chatts_prompt=chatts_prompt, chatts_speaker=chatts_speaker,
-        chatts_seed=chatts_seed, chatts_lang=chatts_lang,
-        chatts_refine=chatts_refine, chatts_refine_prompt=chatts_refine_prompt, chatts_refine_seed=chatts_refine_seed,
-        chatts_normalize=chatts_normalize, chatts_homophone=chatts_homophone, chatts_timeout=chatts_timeout,
-        indextts_url=indextts_url, indextts_prompt_wav=indextts_prompt_wav,
-        indextts_emo_wav=indextts_emo_wav, indextts_emo_text=indextts_emo_text,
-        indextts_use_emo_text=indextts_use_emo_text, indextts_emo_alpha=indextts_emo_alpha,
-        indextts_emo_vector_json=indextts_emo_vector_json, indextts_use_random=indextts_use_random,
-        indextts_interval_silence=indextts_interval_silence, indextts_max_text_tokens=indextts_max_text_tokens,
-        indextts_temperature=indextts_temperature, indextts_top_p=indextts_top_p,
-        indextts_top_k=indextts_top_k, indextts_repetition_penalty=indextts_repetition_penalty,
-        indextts_max_mel_tokens=indextts_max_mel_tokens, indextts_timeout=indextts_timeout,
-        ifly_ws_url=ifly_ws_url, ifly_app_id=ifly_app_id, ifly_key=ifly_key, ifly_secret=ifly_secret,
-        ifly_vcn=args.ifly_vcn, ifly_speed=args.ifly_speed, ifly_volume=args.ifly_volume, ifly_pitch=args.ifly_pitch,
-        ifly_encoding=args.ifly_encoding, ifly_sr=args.ifly_sr, ifly_channels=args.ifly_channels, ifly_bit_depth=args.ifly_bit_depth,
-        ifly_oral_level=args.ifly_oral_level, ifly_stop_split=args.ifly_stop_split, ifly_remain=args.ifly_remain,
-        ifly_by_sent=args.ifly_by_sent, ifly_pause_ms=args.ifly_pause_ms,
-        subtitle=(args.subtitle=="on"),
-        fade=args.fade, fps=args.fps,
-        target_width=args.target_width, target_height=args.target_height,
-        pad_silence=args.pad_silence, on_empty=args.on_empty,
-        workers=args.workers,
-        fast_concat=(args.fast_concat=="on"),
-        enc_workers=args.enc_workers, enc_threads=args.enc_threads,
-        enc_preset=args.enc_preset, enc_crf=args.enc_crf,
-        debug=args.debug, force_ocr=args.force_ocr,
-        skip_stems=skip_stems_value, skip_silence_sec=skip_silence_value,
-        filter_keywords=filter_keywords_tuple,
-    )
+    total_jobs = len(jobs)
+    for job_index, (images, target_out_path) in enumerate(jobs, start=1):
+        print(f"[TASK] {job_index}/{total_jobs} -> {target_out_path}，共 {len(images)} 张图片。")
+        build_video(
+            images=images,
+            out_path=target_out_path,
+            ocr_engine=ocr_engine,
+            lang_ocr=args.lang,
+            ocr_psm=args.ocr_psm,
+            ocr_oem=args.ocr_oem,
+            ocr_crop=ocr_crop,
+            strip_border=args.strip_border,
+            ocr_scale=args.scale,
+            binarize=not args.no_binarize,
+            tencent_model=tencent_model,
+            tts_engine=tts_engine,
+            edge_voice=edge_voice, edge_rate=edge_rate, edge_pitch=edge_pitch, edge_style=edge_style,
+            azure_voice=azure_voice, azure_rate=azure_rate, azure_pitch=azure_pitch, azure_style=azure_style,
+            eleven_voice_id=eleven_voice_id,
+            voice_lang=voice_lang, voice_name=voice_name,
+            chatts_url=chatts_url, chatts_prompt=chatts_prompt, chatts_speaker=chatts_speaker,
+            chatts_seed=chatts_seed, chatts_lang=chatts_lang,
+            chatts_refine=chatts_refine, chatts_refine_prompt=chatts_refine_prompt, chatts_refine_seed=chatts_refine_seed,
+            chatts_normalize=chatts_normalize, chatts_homophone=chatts_homophone, chatts_timeout=chatts_timeout,
+            indextts_url=indextts_url, indextts_prompt_wav=indextts_prompt_wav,
+            indextts_emo_wav=indextts_emo_wav, indextts_emo_text=indextts_emo_text,
+            indextts_use_emo_text=indextts_use_emo_text, indextts_emo_alpha=indextts_emo_alpha,
+            indextts_emo_vector_json=indextts_emo_vector_json, indextts_use_random=indextts_use_random,
+            indextts_interval_silence=indextts_interval_silence, indextts_max_text_tokens=indextts_max_text_tokens,
+            indextts_temperature=indextts_temperature, indextts_top_p=indextts_top_p,
+            indextts_top_k=indextts_top_k, indextts_repetition_penalty=indextts_repetition_penalty,
+            indextts_max_mel_tokens=indextts_max_mel_tokens, indextts_timeout=indextts_timeout,
+            ifly_ws_url=ifly_ws_url, ifly_app_id=ifly_app_id, ifly_key=ifly_key, ifly_secret=ifly_secret,
+            ifly_vcn=args.ifly_vcn, ifly_speed=args.ifly_speed, ifly_volume=args.ifly_volume, ifly_pitch=args.ifly_pitch,
+            ifly_encoding=args.ifly_encoding, ifly_sr=args.ifly_sr, ifly_channels=args.ifly_channels, ifly_bit_depth=args.ifly_bit_depth,
+            ifly_oral_level=args.ifly_oral_level, ifly_stop_split=args.ifly_stop_split, ifly_remain=args.ifly_remain,
+            ifly_by_sent=args.ifly_by_sent, ifly_pause_ms=args.ifly_pause_ms,
+            subtitle=(args.subtitle=="on"),
+            fade=args.fade, fps=args.fps,
+            target_width=args.target_width, target_height=args.target_height,
+            pad_silence=args.pad_silence, on_empty=args.on_empty,
+            workers=args.workers,
+            fast_concat=(args.fast_concat=="on"),
+            enc_workers=args.enc_workers, enc_threads=args.enc_threads,
+            enc_preset=args.enc_preset, enc_crf=args.enc_crf,
+            debug=args.debug, force_ocr=args.force_ocr,
+            skip_stems=skip_stems_value, skip_silence_sec=skip_silence_value,
+            filter_keywords=filter_keywords_tuple,
+        )
 
 if __name__ == "__main__":
     main()
