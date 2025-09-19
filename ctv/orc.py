@@ -260,6 +260,7 @@ def _read_pdf_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> Li
     if decoded_bytes is None:
         decoded_bytes, _ = _decode_base64_data(b64)
     errors: List[str] = []
+    target_dpi = max(PDF_RENDER_DPI, 72)
 
     if pypdfium2 is not None:
         try:
@@ -268,7 +269,7 @@ def _read_pdf_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> Li
             errors.append(f"pypdfium2: {exc}")
         else:
             images: List[Image.Image] = []
-            scale = max(PDF_RENDER_DPI, 72) / 72.0
+            scale = target_dpi / 72.0
             try:
                 for page in pdf:
                     bitmap = None
@@ -297,7 +298,7 @@ def _read_pdf_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> Li
             errors.append("pypdfium2: no pages rendered")
 
     try:
-        return convert_from_bytes(decoded_bytes)
+        return convert_from_bytes(decoded_bytes, dpi=target_dpi)
     except Exception as exc:
         errors.append(f"pdf2image: {exc}")
         raise ValueError("PDF 转图片失败: " + "; ".join(errors))
