@@ -22,7 +22,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field, model_validator
 from PIL import Image, ImageDraw
 from pdf2image import convert_from_bytes
 import uvicorn
@@ -136,9 +136,9 @@ class OcrReq(BaseModel):
     file_b64: Optional[str] = None   # 新字段，便于传除图片以外的文件（如 PDF）
     fileType: Optional[str] = None   # 可选明确文件类型，pdf/image/...
 
-    @root_validator
-    def _ensure_payload(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        if not (values.get("file_b64") or values.get("image_b64")):
+    @model_validator(mode="after")
+    def _ensure_payload(cls, values: "OcrReq") -> "OcrReq":
+        if not (values.file_b64 or values.image_b64):
             raise ValueError("image_b64 或 file_b64 必须提供一个")
         return values
 
