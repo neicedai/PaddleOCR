@@ -12,7 +12,7 @@ ctv_cloud_env.py  (with iFLYTEK Private WS TTS integrated)
 - 快速管线：分段 ffmpeg 编码 + 无重编码 concat； MoviePy 2.x 兼容
 """
 
-import argparse, os, re, sys, tempfile, subprocess, base64, time, json, asyncio, ssl, hashlib, hmac, urllib.parse, zipfile
+import argparse, os, re, sys, tempfile, subprocess, base64, time, json, asyncio, ssl, hashlib, hmac, urllib.parse, zipfile, shutil
 from contextlib import ExitStack
 from io import BytesIO
 from urllib.parse import urlparse
@@ -70,11 +70,42 @@ def _env_for_emotion(key: str, emotion: Optional[str]) -> Optional[str]:
 def natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
 def list_images_sorted(images_dir: Path) -> List[Path]:
-    exts = {'.jpg','.jpeg','.png','.bmp','.webp','.tif','.tiff'}
-    files = [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    files = [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
     files.sort(key=lambda p: natural_key(p.name))
     return files
+
+
+def list_pdfs_sorted(path: Path) -> List[Path]:
+    pdfs = [p for p in path.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+    pdfs.sort(key=lambda p: natural_key(p.name))
+    return pdfs
+
+
+def convert_pdf_to_images(pdf_path: Path, output_dir: Path) -> List[Path]:
+    import fitz  # type: ignore
+
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    doc = fitz.open(pdf_path)
+    try:
+        img_paths: List[Path] = []
+        for page_idx in range(doc.page_count):
+            page = doc.load_page(page_idx)
+            pix = page.get_pixmap()
+            if pix.alpha:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            img_path = output_dir / f"{pdf_path.stem}_{page_idx + 1:04d}.png"
+            pix.save(str(img_path))
+            img_paths.append(img_path)
+        return img_paths
+    finally:
+        doc.close()
 
 def ensure_font(size: int):
     cands = [
@@ -1258,11 +1289,58 @@ def main():
             path = (env_base_dir / path).resolve()
         return str(path)
 
-    images_dir = Path(args.images_dir).expanduser().resolve()
-    if not images_dir.exists(): print(f"图片目录不存在：{images_dir}", file=sys.stderr); sys.exit(1)
-    images = list_images_sorted(images_dir)
-    if not images: print(f"目录中没有图片：{images_dir}", file=sys.stderr); sys.exit(1)
+    input_path = Path(args.images_dir).expanduser().resolve()
+    if not input_path.exists():
+        print(f"输入路径不存在：{input_path}", file=sys.stderr)
+        sys.exit(1)
     out_path = Path(args.out).expanduser().resolve()
+    pdf_image_root = out_path.parent / "_ctv_build" / "pdf_images"
+
+    images: List[Path] = []
+
+    def _convert_and_collect(pdf_file: Path) -> List[Path]:
+        print(f"[PDF] 开始转换：{pdf_file}")
+        try:
+            converted = convert_pdf_to_images(pdf_file, pdf_image_root / pdf_file.stem)
+        except ImportError:
+            print("缺少 PyMuPDF，请先安装：pip install PyMuPDF", file=sys.stderr)
+            sys.exit(1)
+        except Exception as err:
+            print(f"PDF 转图片失败：{pdf_file} -> {err}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[PDF] 转换完成：{pdf_file.name} -> {len(converted)} 张图片，输出目录：{pdf_image_root / pdf_file.stem}")
+        return converted
+
+    if input_path.is_dir():
+        pdfs = list_pdfs_sorted(input_path)
+        image_files = list_images_sorted(input_path)
+        if pdfs and image_files:
+            print(f"目录中同时包含 PDF 和 图片，请分开存放：{input_path}", file=sys.stderr)
+            sys.exit(1)
+        if pdfs:
+            print(f"[INPUT] 检测到 {len(pdfs)} 个 PDF 文件，准备转换为图片...")
+            for pdf_file in pdfs:
+                images.extend(_convert_and_collect(pdf_file))
+        else:
+            images = image_files
+            print(f"[INPUT] 检测到 {len(images)} 张图片：{input_path}")
+    else:
+        suffix = input_path.suffix.lower()
+        if suffix == ".pdf":
+            print("[INPUT] 检测到 PDF 文件，准备转换为图片...")
+            images = _convert_and_collect(input_path)
+        elif suffix in IMAGE_EXTS:
+            images = [input_path]
+            print(f"[INPUT] 使用单张图片：{input_path}")
+        else:
+            print(f"不支持的输入文件类型：{input_path}", file=sys.stderr)
+            sys.exit(1)
+
+    if not images:
+        print(f"未找到可处理的图片：{input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[INPUT] 总计 {len(images)} 张图片待处理。")
 
     # 选择 OCR / TTS
     ocr_engine = pick_engine(args.ocr_engine, "OCR_VENDOR", "tencent",
