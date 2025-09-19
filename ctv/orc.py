@@ -72,7 +72,11 @@ USE_CLS      = os.getenv("OCR_CLS", "0") == "1"     # 默认关，加速
 # 端口
 PORT         = int(os.getenv("OCR_PORT", "8001"))
 # 限制检测侧边（缩放上限），默认 960；小一些可提速
+# PaddleX 内部还会有一个上限（默认 4000），当原图尺寸超过该值时会打印大量提示。
+# 这里允许通过环境变量覆盖（默认沿用 PaddleX 的 4000），同时在送入模型前主动
+# 将图片缩放到该范围，避免底层重复打印日志。
 DET_MAX_SIDE = int(os.getenv("OCR_DET_LIMIT_SIDE", "960"))
+MAX_SIDE_LIMIT = int(os.getenv("OCR_MAX_SIDE_LIMIT", "4000"))
 # 识别批大小，CPU/GPU 可调 16~64 观察吞吐
 REC_BATCH    = int(os.getenv("OCR_REC_BATCH", "32"))
 # 强制设备（仅用于日志提示）：gpu / cpu（实际设备由 use_gpu & 环境决定）
@@ -256,6 +260,28 @@ def _read_image_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> 
     return Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
 
 
+def _ensure_max_side_limit(img: Image.Image) -> Image.Image:
+    """将图片缩放到不超过 PaddleX 的最大边限制，避免底层重复打印警告。"""
+    limit = MAX_SIDE_LIMIT
+    if limit <= 0:
+        return img
+
+    w, h = img.size
+    max_side = max(w, h)
+    if max_side <= limit:
+        return img
+
+    scale = limit / max_side
+    new_size = (max(int(round(w * scale)), 1), max(int(round(h * scale)), 1))
+    resized = img.resize(new_size, Image.LANCZOS)
+    print(
+        f"[RESIZE] shrink image from {w}x{h} to {resized.size[0]}x{resized.size[1]} (limit={limit})",
+        file=sys.stderr,
+        flush=True,
+    )
+    return resized
+
+
 def _read_pdf_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> List[Image.Image]:
     if decoded_bytes is None:
         decoded_bytes, _ = _decode_base64_data(b64)
@@ -371,7 +397,8 @@ def do_ocr(req: OcrReq):
             total_lines: List[OcrLine] = []
             pages_resp: List[OcrPage] = []
             for page_idx, page_image in enumerate(pages, start=1):
-                arr = np.array(page_image.convert("RGB"))
+                page_image = _ensure_max_side_limit(page_image.convert("RGB"))
+                arr = np.array(page_image)
                 try:
                     result = ocr.predict(arr, use_textline_orientation=USE_CLS)
                 except Exception as exc:
@@ -394,6 +421,7 @@ def do_ocr(req: OcrReq):
 
         # 默认按图片处理
         img = _read_image_from_b64(payload, decoded_bytes=decoded_bytes)
+        img = _ensure_max_side_limit(img)
         arr = np.array(img)  # HWC, RGB
         t0 = time.time()
         result = ocr.predict(arr, use_textline_orientation=USE_CLS)
