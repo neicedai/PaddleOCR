@@ -282,18 +282,72 @@ def _read_image_from_b64(b64: str) -> Image.Image:
         return img
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
+def _cluster_bottom_text_entries(
+    entries: List[Tuple[int, np.ndarray]], image_height: int
+) -> Optional[List[int]]:
+    """基于检测框的纵向位置，将最底部的一段文字行聚为一个簇.
+
+    返回属于底部簇的 entry 索引列表，若无法确定则返回 ``None``。
+    """
+
+    if not entries or image_height <= 0:
+        return None
+
+    # 收集每个文本框的 (top_y, bottom_y) 范围，并按照 top_y 升序排序
+    spans: List[Tuple[int, float, float]] = []
+    for idx, box in entries:
+        if box.size == 0:
+            continue
+        ys = box[..., 1].reshape(-1)
+        spans.append((idx, float(ys.min()), float(ys.max())))
+
+    if not spans:
+        return None
+
+    spans.sort(key=lambda item: item[1])
+    bottom_idx, bottom_top, bottom_bottom = spans[-1]
+    selected = {bottom_idx}
+    cluster_top = bottom_top
+    cluster_bottom = bottom_bottom
+
+    # 从底部向上合并间隔较小的文本行，允许轻微的留白
+    gap_tolerance = max(image_height * 0.02, 8.0)
+    for idx, top, bottom in reversed(spans[:-1]):
+        if cluster_top - bottom > gap_tolerance:
+            break
+        selected.add(idx)
+        cluster_top = min(cluster_top, top)
+        cluster_bottom = max(cluster_bottom, bottom)
+
+    # 若聚合后的底部文本并不靠近图像底部，则认为判断不可靠
+    if cluster_bottom < image_height * 0.45:
+        return None
+
+    # 将所有与该纵向范围有重叠的行都纳入，避免遗漏同一文本块
+    for idx, top, bottom in spans:
+        if idx in selected:
+            continue
+        overlaps = not (bottom < cluster_top or top > cluster_bottom)
+        if overlaps:
+            selected.add(idx)
+
+    return sorted(selected)
+
+
 @app.post("/ocr", response_model=OcrResp)
 def do_ocr(req: OcrReq):
     try:
         img = _read_image_from_b64(req.image_b64)
         arr = np.array(img)  # HWC, RGB
+
         t0 = time.time()
         result = ocr.predict(arr, use_textline_orientation=USE_CLS)
         dt = time.time() - t0
         print(f"[REQ] one image OK in {dt:.2f}s | device={'GPU' if USING_GPU else 'CPU'} | cls={USE_CLS}",
               file=sys.stderr, flush=True)
 
-        lines: List[Dict[str, Any]] = []
+        parsed_entries: List[Dict[str, Any]] = []
+        box_entries: List[Tuple[int, np.ndarray]] = []
         if result:
             for res in result:
                 data = res
@@ -326,23 +380,67 @@ def do_ocr(req: OcrReq):
                                 flush=True,
                             )
                     score = float(scores[idx]) if idx < len(scores) else 0.0
-                    box = None
+                    box_raw = None
                     if isinstance(boxes, (list, tuple)) and idx < len(boxes):
-                        box = boxes[idx]
+                        box_raw = boxes[idx]
                     elif (
                         hasattr(boxes, "__getitem__")
                         and hasattr(boxes, "__len__")
                         and idx < len(boxes)
                     ):
-                        box = boxes[idx]
-                    if box is not None:
-                        box = np.asarray(box).tolist()
+                        box_raw = boxes[idx]
+                    box_arr = None
+                    if box_raw is not None:
+                        box_arr = np.asarray(box_raw, dtype=float)
+                        box_entries.append((len(parsed_entries), box_arr))
+                    parsed_entries.append({
+                        "raw_text": text_clean,
+                        "score": score,
+                        "box_arr": box_arr,
+                    })
+
+        selected_indices: Optional[List[int]] = None
+        if parsed_entries:
+            selected_indices = _cluster_bottom_text_entries(box_entries, arr.shape[0])
+            if selected_indices:
+                print(
+                    f"[CROP] focus bottom lines idx={selected_indices}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        lines: List[Dict[str, Any]] = []
+        indices_to_keep = selected_indices or list(range(len(parsed_entries)))
+        for idx in indices_to_keep:
+            entry = parsed_entries[idx]
+            text_clean = entry["raw_text"]
+            converted = text_clean
+            if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
+                try:
+                    converted = _T2S_CONVERTER(text_clean)
+                except Exception as exc:  # pragma: no cover
                     print(
-                        f"[REC] text='{text_clean}' score={score:.4f}",
+                        f"[REC][WARN] T2S convert failed: {exc}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    lines.append({"text": text_clean, "score": score, "box": box})
+                else:
+                    if converted != text_clean:
+                        print(
+                            f"[REC][T2S] '{text_clean}' -> '{converted}'",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+            score = entry["score"]
+            box_arr = entry["box_arr"]
+            box = box_arr.tolist() if box_arr is not None else None
+            final_text = converted
+            print(
+                f"[REC] text='{final_text}' score={score:.4f}",
+                file=sys.stderr,
+                flush=True,
+            )
+            lines.append({"text": final_text, "score": score, "box": box})
         return OcrResp(ok=True, lines=[OcrLine(**l) for l in lines])
     except Exception as e:
         err = str(e)
