@@ -241,13 +241,17 @@ def main(args):
             for text, score in rec_res:
                 logger.debug("{}, {:.3f}".format(text, score))
 
-            res = [
-                {
-                    "transcription": rec_res[i][0],
-                    "points": np.array(dt_boxes[i]).astype(np.int32).tolist(),
-                }
-                for i in range(len(dt_boxes))
-            ]
+            paragraph = " ".join([rec_res[i][0] for i in range(len(rec_res))])
+            res = {
+                "paragraph": paragraph,
+                "details": [
+                    {
+                        "transcription": rec_res[i][0],
+                        "points": np.array(dt_boxes[i]).astype(np.int32).tolist(),
+                    }
+                    for i in range(len(dt_boxes))
+                ],
+            }
             if len(imgs) > 1:
                 save_pred = (
                     os.path.basename(image_file)
