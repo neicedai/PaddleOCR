@@ -112,6 +112,37 @@ if OCR_LANG_ALIAS:
 else:
     print(f"[CONFIG] PaddleOCR lang={OCR_LANG}", file=sys.stderr, flush=True)
 
+_T2S_CONVERTER = None
+_OPENCC_T2S_ENABLED = OCR_LANG == "chinese_cht"
+if _OPENCC_T2S_ENABLED:
+    try:
+        from opencc import OpenCC  # type: ignore
+
+        _T2S_CONVERTER = OpenCC("t2s").convert
+        print(
+            "[CONFIG] Traditional Chinese output will be converted to Simplified via opencc.",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:  # pragma: no cover - optional dependency
+        try:
+            from zhconv import convert  # type: ignore
+
+            _T2S_CONVERTER = lambda text: convert(text, "zh-hans")
+            print(
+                "[CONFIG] Traditional Chinese output will be converted to Simplified via zhconv.",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc2:  # pragma: no cover - optional dependency
+            print(
+                "[CONFIG][WARN] No T2S converter available (opencc error: "
+                f"{exc}; zhconv error: {exc2}). Traditional text will remain unchanged.",
+                file=sys.stderr,
+                flush=True,
+            )
+            _OPENCC_T2S_ENABLED = False
+
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
     """优先 GPU 初始化；失败时（如 cuDNN 缺失）自动回退到 CPU，除非 GPU_STRICT=1"""
@@ -251,13 +282,78 @@ def _read_image_from_b64(b64: str) -> Image.Image:
         return img
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
+def _locate_bottom_text_region(arr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """粗略估计图像中底部文字块的矩形区域."""
+
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        return None
+
+    h, w = arr.shape[:2]
+    if h < 10 or w < 10:
+        return None
+
+    # 灰度 -> 统计每行深色像素数量，估计文字分布
+    gray = np.dot(arr[..., :3], [0.299, 0.587, 0.114])
+    dark = gray < 200  # 允许老旧扫描件，阈值稍高
+    row_density = dark.sum(axis=1)
+    if not np.any(row_density):
+        return None
+
+    density_threshold = max(int(np.percentile(row_density, 80)), int(0.05 * w))
+    candidate_rows = np.where(row_density >= density_threshold)[0]
+    if candidate_rows.size == 0:
+        return None
+
+    # 聚焦于最底部的连通行段
+    bottom_row = candidate_rows[-1]
+    top_row = bottom_row
+    for idx in range(candidate_rows.size - 1, 0, -1):
+        if candidate_rows[idx] - candidate_rows[idx - 1] > 1:
+            break
+        top_row = candidate_rows[idx - 1]
+
+    top_row = max(0, top_row - int(0.02 * h))
+    bottom_row = min(h, bottom_row + int(0.02 * h) + 1)
+
+    col_slice = dark[top_row:bottom_row, :].sum(axis=0)
+    if not np.any(col_slice):
+        return None
+
+    col_threshold = max(int(np.percentile(col_slice, 70)), int(0.03 * h))
+    cols = np.where(col_slice >= col_threshold)[0]
+    if cols.size == 0:
+        return None
+
+    left_col = max(0, cols[0] - int(0.01 * w))
+    right_col = min(w, cols[-1] + int(0.01 * w) + 1)
+
+    if right_col - left_col < 5 or bottom_row - top_row < 5:
+        return None
+
+    return left_col, top_row, right_col, bottom_row
+
+
 @app.post("/ocr", response_model=OcrResp)
 def do_ocr(req: OcrReq):
     try:
         img = _read_image_from_b64(req.image_b64)
         arr = np.array(img)  # HWC, RGB
+
+        crop_box = _locate_bottom_text_region(arr)
+        if crop_box:
+            x0, y0, x1, y1 = crop_box
+            arr_for_ocr = arr[y0:y1, x0:x1]
+            print(
+                f"[CROP] bottom text region located at (x0={x0}, y0={y0}, x1={x1}, y1={y1})",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            arr_for_ocr = arr
+            x0 = y0 = 0
+
         t0 = time.time()
-        result = ocr.predict(arr, use_textline_orientation=USE_CLS)
+        result = ocr.predict(arr_for_ocr, use_textline_orientation=USE_CLS)
         dt = time.time() - t0
         print(f"[REQ] one image OK in {dt:.2f}s | device={'GPU' if USING_GPU else 'CPU'} | cls={USE_CLS}",
               file=sys.stderr, flush=True)
@@ -285,6 +381,22 @@ def do_ocr(req: OcrReq):
                     if not text or not text.strip():
                         continue
                     text_clean = text.strip()
+                    converted = text_clean
+                    if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
+                        try:
+                            converted = _T2S_CONVERTER(text_clean)
+                        except Exception as exc:  # pragma: no cover - conversion failure shouldn't break OCR
+                            print(
+                                f"[REC][WARN] T2S convert failed: {exc}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[REC][T2S] '{text_clean}' -> '{converted}'",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                     score = float(scores[idx]) if idx < len(scores) else 0.0
                     box = None
                     if isinstance(boxes, (list, tuple)) and idx < len(boxes):
@@ -296,13 +408,21 @@ def do_ocr(req: OcrReq):
                     ):
                         box = boxes[idx]
                     if box is not None:
-                        box = np.asarray(box).tolist()
+                        box_arr = np.asarray(box, dtype=float)
+                        if crop_box:
+                            offset = np.array([[x0, y0]], dtype=box_arr.dtype)
+                            if box_arr.ndim == 2:
+                                box_arr = box_arr + offset
+                            else:
+                                box_arr = box_arr + offset.reshape((-1, 1, 2))
+                        box = box_arr.tolist()
+                    final_text = converted
                     print(
-                        f"[REC] text='{text_clean}' score={score:.4f}",
+                        f"[REC] text='{final_text}' score={score:.4f}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    lines.append({"text": text_clean, "score": score, "box": box})
+                    lines.append({"text": final_text, "score": score, "box": box})
         return OcrResp(ok=True, lines=[OcrLine(**l) for l in lines])
     except Exception as e:
         err = str(e)
