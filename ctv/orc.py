@@ -19,7 +19,7 @@ GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
 """
 
 import base64, io, os, sys, time, json
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 import numpy as np
 from fastapi import FastAPI
@@ -260,6 +260,22 @@ def _read_image_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> 
     return Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
 
 
+_RESIZE_LOGGED: Set[Tuple[int, int, int, int, int]] = set()
+
+
+def _log_resize_once(key: Tuple[int, int, int, int, int]) -> bool:
+    """Return True if resize log should be emitted for the given key."""
+    if key in _RESIZE_LOGGED:
+        return False
+    _RESIZE_LOGGED.add(key)
+    # Bound the cache size to avoid unbounded growth when dimensions vary widely.
+    if len(_RESIZE_LOGGED) > 64:
+        # Simple eviction strategy: clear the cache when it grows too large.
+        _RESIZE_LOGGED.clear()
+        _RESIZE_LOGGED.add(key)
+    return True
+
+
 def _ensure_max_side_limit(img: Image.Image) -> Image.Image:
     """将图片缩放到不超过 PaddleX 的最大边限制，避免底层重复打印警告。"""
     limit = MAX_SIDE_LIMIT
@@ -274,11 +290,13 @@ def _ensure_max_side_limit(img: Image.Image) -> Image.Image:
     scale = limit / max_side
     new_size = (max(int(round(w * scale)), 1), max(int(round(h * scale)), 1))
     resized = img.resize(new_size, Image.LANCZOS)
-    print(
-        f"[RESIZE] shrink image from {w}x{h} to {resized.size[0]}x{resized.size[1]} (limit={limit})",
-        file=sys.stderr,
-        flush=True,
-    )
+    key = (w, h, resized.size[0], resized.size[1], limit)
+    if _log_resize_once(key):
+        print(
+            f"[RESIZE] shrink image from {w}x{h} to {resized.size[0]}x{resized.size[1]} (limit={limit})",
+            file=sys.stderr,
+            flush=True,
+        )
     return resized
 
 
