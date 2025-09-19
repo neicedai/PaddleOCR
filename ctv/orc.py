@@ -8,13 +8,14 @@ GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
     POST /ocr      { "image_b64"|"file_b64": "<base64或dataURL>", "fileType"?: "pdf"|"image" }
                   -> { ok, lines:[{text, score, box, page}], error? }
     GET  /healthz  -> { ok: true }
-    GET  /version  -> { paddleocr, paddlepaddle, device, use_gpu, cls, pdf_support, pdf_page_limit }
-- 依赖：fastapi uvicorn pillow numpy pdf2image paddleocr（以及已装好的 paddlepaddle-gpu 3.x + cuDNN8、poppler）
+    GET  /version  -> { paddleocr, paddlepaddle, device, use_gpu, cls, pdf_support, pdf_page_limit, pdf_renderer }
+- 依赖：fastapi uvicorn pillow numpy paddleocr；
+      PDF 支持优先使用 pypdfium2（纯 Python），若缺失则回退 pdf2image（需系统级 poppler）
 建议：
     pip install -U fastapi uvicorn pillow numpy pdf2image
     pip install paddleocr>=3.0.0
     pip install "paddlepaddle-gpu==2.6.1" -f https://www.paddlepaddle.org.cn/whl/cu121.html
-    # pdf2image 依赖系统级 poppler，可通过 apt/yum/brew 安装 poppler-utils
+    pip install pypdfium2  # 可选但推荐，避免额外安装 poppler
 """
 
 import base64, io, os, sys, time, json
@@ -28,7 +29,15 @@ from pdf2image import convert_from_bytes
 import uvicorn
 
 from paddleocr import PaddleOCR
-import pkg_resources
+try:  # pragma: no cover - pkg_resources 可选
+    import pkg_resources
+except Exception:  # pragma: no cover - 兼容缺失
+    pkg_resources = None
+
+try:  # pragma: no cover - 运行环境可能缺失，可选依赖
+    import pypdfium2  # type: ignore
+except Exception:  # pragma: no cover - 保持运行
+    pypdfium2 = None  # type: ignore
 # ---- cuDNN 预加载 & 启动自检（务必放在 import PaddleOCR / Paddle 之前） ----
 import os, sys, ctypes
 
@@ -68,6 +77,7 @@ DET_MAX_SIDE = int(os.getenv("OCR_DET_LIMIT_SIDE", "960"))
 REC_BATCH    = int(os.getenv("OCR_REC_BATCH", "32"))
 # 强制设备（仅用于日志提示）：gpu / cpu（实际设备由 use_gpu & 环境决定）
 PREF_DEV     = os.getenv("OCR_DEVICE", "gpu").lower()
+PDF_RENDER_DPI = int(os.getenv("OCR_PDF_DPI", "300"))
 
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
@@ -166,29 +176,36 @@ def healthz():
 
 @app.get("/version")
 def version():
+    base = {
+        "device": "gpu" if USING_GPU else "cpu",
+        "use_gpu": USING_GPU,
+        "cls": USE_CLS,
+        "det_limit_side_len": DET_MAX_SIDE,
+        "rec_batch_num": REC_BATCH,
+        "pdf_support": True,
+        "pdf_page_limit": None,
+        "pdf_renderer": "pypdfium2" if pypdfium2 is not None else "pdf2image",
+    }
+
+    if pkg_resources is None:
+        base.update({
+            "paddleocr": "unknown",
+            "paddlepaddle": "unknown",
+        })
+        return base
+
     try:
-        return {
+        base.update({
             "paddleocr": pkg_resources.get_distribution("paddleocr").version,
             "paddlepaddle": pkg_resources.get_distribution("paddlepaddle-gpu").version
                               if USING_GPU else pkg_resources.get_distribution("paddlepaddle").version,
-            "device": "gpu" if USING_GPU else "cpu",
-            "use_gpu": USING_GPU,
-            "cls": USE_CLS,
-            "det_limit_side_len": DET_MAX_SIDE,
-            "rec_batch_num": REC_BATCH,
-            "pdf_support": True,
-            "pdf_page_limit": None,
-        }
+        })
     except Exception:
-        return {
+        base.update({
             "paddleocr": "unknown",
             "paddlepaddle": "unknown",
-            "device": "gpu" if USING_GPU else "cpu",
-            "use_gpu": USING_GPU,
-            "cls": USE_CLS,
-            "pdf_support": True,
-            "pdf_page_limit": None,
-        }
+        })
+    return base
 
 def _split_data_url(b64: str) -> Tuple[str, Optional[str]]:
     """将 dataURL 拆分为 base64 主体与 mime 信息"""
@@ -242,10 +259,48 @@ def _read_image_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> 
 def _read_pdf_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> List[Image.Image]:
     if decoded_bytes is None:
         decoded_bytes, _ = _decode_base64_data(b64)
+    errors: List[str] = []
+
+    if pypdfium2 is not None:
+        try:
+            pdf = pypdfium2.PdfDocument(io.BytesIO(decoded_bytes))
+        except Exception as exc:
+            errors.append(f"pypdfium2: {exc}")
+        else:
+            images: List[Image.Image] = []
+            scale = max(PDF_RENDER_DPI, 72) / 72.0
+            try:
+                for page in pdf:
+                    bitmap = None
+                    try:
+                        bitmap = page.render(scale=scale)
+                        pil_image = bitmap.to_pil()
+                        images.append(pil_image)
+                    finally:
+                        if bitmap is not None:
+                            try:
+                                bitmap.close()
+                            except Exception:
+                                pass
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    pdf.close()
+                except Exception:
+                    pass
+
+            if images:
+                return images
+            errors.append("pypdfium2: no pages rendered")
+
     try:
         return convert_from_bytes(decoded_bytes)
     except Exception as exc:
-        raise ValueError(f"PDF 转图片失败: {exc}")
+        errors.append(f"pdf2image: {exc}")
+        raise ValueError("PDF 转图片失败: " + "; ".join(errors))
 
 
 def _collect_lines(result: Any, page: int) -> List[Dict[str, Any]]:
