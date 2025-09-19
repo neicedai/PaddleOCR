@@ -376,16 +376,7 @@ def do_ocr(req: OcrReq):
                 for idx, text in enumerate(texts):
                     if not text or not text.strip():
                         continue
-                    text_clean = text.strip()
-                    if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
-                        try:
-                            text_clean = _T2S_CONVERTER(text_clean)
-                        except Exception as exc:  # pragma: no cover - conversion failure shouldn't break OCR
-                            print(
-                                f"[REC][WARN] T2S convert failed: {exc}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
+                    original_text = text.strip()
                     score = float(scores[idx]) if idx < len(scores) else 0.0
                     box_raw = None
                     if isinstance(boxes, (list, tuple)) and idx < len(boxes):
@@ -401,7 +392,7 @@ def do_ocr(req: OcrReq):
                         box_arr = np.asarray(box_raw, dtype=float)
                         box_entries.append((len(parsed_entries), box_arr))
                     parsed_entries.append({
-                        "raw_text": text_clean,
+                        "raw_text": original_text,
                         "score": score,
                         "box_arr": box_arr,
                     })
@@ -427,11 +418,11 @@ def do_ocr(req: OcrReq):
         indices_to_keep = selected_indices or list(range(len(parsed_entries)))
         for idx in indices_to_keep:
             entry = parsed_entries[idx]
-            text_clean = entry["raw_text"]
-            converted = text_clean
+            raw_text = entry["raw_text"]
+            simplified_text = raw_text
             if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
                 try:
-                    converted = _T2S_CONVERTER(text_clean)
+                    simplified_text = _T2S_CONVERTER(raw_text)
                 except Exception as exc:  # pragma: no cover
                     print(
                         f"[REC][WARN] T2S convert failed: {exc}",
@@ -439,16 +430,17 @@ def do_ocr(req: OcrReq):
                         flush=True,
                     )
                 else:
-                    if converted != text_clean:
+                    if simplified_text != raw_text:
                         print(
-                            f"[REC][T2S] '{text_clean}' -> '{converted}'",
+                            f"[REC][T2S] '{raw_text}' -> '{simplified_text}'",
                             file=sys.stderr,
                             flush=True,
                         )
             score = entry["score"]
             box_arr = entry["box_arr"]
             box = box_arr.tolist() if box_arr is not None else None
-            final_text = converted
+            entry["simplified_text"] = simplified_text
+            final_text = simplified_text
             print(
                 f"[REC] text='{final_text}' score={score:.4f}",
                 file=sys.stderr,
