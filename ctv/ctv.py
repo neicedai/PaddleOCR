@@ -77,10 +77,11 @@ def list_images_sorted(images_dir: Path) -> List[Path]:
     return files
 
 
-def convert_pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 300) -> List[Path]:
+def convert_pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 300) -> Tuple[List[Path], Dict[str, int]]:
     """Render a PDF file into PNG images stored in *out_dir*.
 
-    Returns the generated image paths sorted by page order.
+    Returns the generated image paths sorted by page order along with a mapping
+    from the generated image stem to the page index (1-based).
     """
     try:
         import pypdfium2  # type: ignore
@@ -90,6 +91,7 @@ def convert_pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 300) -> List
 
     doc = pypdfium2.PdfDocument(str(pdf_path))
     images: List[Path] = []
+    page_map: Dict[str, int] = {}
     # dpi 转换到 Pdfium scale（72 DPI 为 1.0）
     scale = max(dpi, 72) / 72.0
     try:
@@ -101,10 +103,11 @@ def convert_pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 300) -> List
             pil_image.close()
             bitmap.close()
             images.append(out_path)
+            page_map[out_path.stem] = page_index
     finally:
         doc.close()
 
-    return images
+    return images, page_map
 
 
 class PrepareImagesResult(NamedTuple):
@@ -113,6 +116,7 @@ class PrepareImagesResult(NamedTuple):
     temp_ctx: Optional[tempfile.TemporaryDirectory]
     pdf_source: Optional[Path]
     pdf_candidates: List[Path]
+    pdf_page_map: Dict[str, int]
 
 
 def prepare_images(input_path: Path) -> PrepareImagesResult:
@@ -128,7 +132,7 @@ def prepare_images(input_path: Path) -> PrepareImagesResult:
     if input_path.is_dir():
         images = list_images_sorted(input_path)
         if images:
-            return PrepareImagesResult(input_path, images, None, None, [])
+            return PrepareImagesResult(input_path, images, None, None, [], {})
 
         pdf_candidates = [
             p for p in input_path.iterdir()
@@ -139,19 +143,19 @@ def prepare_images(input_path: Path) -> PrepareImagesResult:
             pdf_path = pdf_candidates[0]
             tmp_ctx = tempfile.TemporaryDirectory(prefix="ctv_pdf_")
             tmp_dir = Path(tmp_ctx.name)
-            images = convert_pdf_to_images(pdf_path, tmp_dir)
+            images, page_map = convert_pdf_to_images(pdf_path, tmp_dir)
             images.sort(key=lambda p: natural_key(p.name))
-            return PrepareImagesResult(tmp_dir, images, tmp_ctx, pdf_path, pdf_candidates)
+            return PrepareImagesResult(tmp_dir, images, tmp_ctx, pdf_path, pdf_candidates, page_map)
 
-        return PrepareImagesResult(input_path, [], None, None, [])
+        return PrepareImagesResult(input_path, [], None, None, [], {})
 
     suffix = input_path.suffix.lower()
     if suffix == ".pdf" and input_path.is_file():
         tmp_ctx = tempfile.TemporaryDirectory(prefix="ctv_pdf_")
         tmp_dir = Path(tmp_ctx.name)
-        images = convert_pdf_to_images(input_path, tmp_dir)
+        images, page_map = convert_pdf_to_images(input_path, tmp_dir)
         images.sort(key=lambda p: natural_key(p.name))
-        return PrepareImagesResult(tmp_dir, images, tmp_ctx, input_path, [input_path])
+        return PrepareImagesResult(tmp_dir, images, tmp_ctx, input_path, [input_path], page_map)
 
     raise ValueError(f"不支持的输入：{input_path}")
 
@@ -353,6 +357,56 @@ def ocr_text_http(img: Image.Image, url: str) -> str:
         raise RuntimeError(data.get("error", "OCR service error"))
     lines = [l.get("text", "") for l in data.get("lines", []) if l.get("text")]
     return "\n".join(lines).strip()
+
+
+def ocr_pdf_pages_http(pdf_b64: str, url: str) -> Dict[int, str]:
+    payload = {"file_b64": pdf_b64, "fileType": "pdf"}
+    r = requests.post(url, json=payload, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", "OCR service error"))
+
+    page_texts: Dict[int, str] = {}
+    pages_payload = data.get("pages")
+    if isinstance(pages_payload, list):
+        for entry in pages_payload:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                page_idx = int(entry.get("page") or entry.get("pageIndex") or 1)
+            except Exception:
+                page_idx = 1
+            text_val = entry.get("text")
+            if text_val is None:
+                lines_payload = entry.get("lines") or []
+                texts = []
+                for line in lines_payload:
+                    if not isinstance(line, dict):
+                        continue
+                    txt = (line.get("text") or "").strip()
+                    if txt:
+                        texts.append(txt)
+                text_val = "\n".join(texts)
+            page_texts[page_idx] = (text_val or "").strip()
+
+    if not page_texts:
+        grouped: Dict[int, List[str]] = {}
+        for line in data.get("lines", []):
+            if not isinstance(line, dict):
+                continue
+            try:
+                page_idx = int(line.get("page") or 1)
+            except Exception:
+                page_idx = 1
+            txt = (line.get("text") or "").strip()
+            if not txt:
+                continue
+            grouped.setdefault(page_idx, []).append(txt)
+        for page_idx, texts in grouped.items():
+            page_texts[page_idx] = "\n".join(texts).strip()
+
+    return page_texts
 
 def ocr_image(image_path: Path,
               engine: str,
@@ -842,9 +896,11 @@ def worker_process_one(img_path_str: str,
                        ifly_by_sent: bool, ifly_pause_ms: int,
                        audio_dir_str: str, text_dir_str: str,
                        on_empty: str, pad_silence: float, debug: bool, force_ocr: bool,
-                       filter_keywords: Tuple[str, ...]):
+                       filter_keywords: Tuple[str, ...],
+                       pdf_page_texts: Optional[Dict[str, str]]):
     img_path = Path(img_path_str)
     audio_dir, text_dir = Path(audio_dir_str), Path(text_dir_str)
+    pdf_text_map: Dict[str, str] = pdf_page_texts or {}
 
     logs_dir = audio_dir.parent / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -872,9 +928,12 @@ def worker_process_one(img_path_str: str,
     need_ocr = force_ocr or (not text_path.exists()) or (text_path.read_text(encoding="utf-8", errors="ignore").strip() == "")
     if need_ocr:
         try:
-            raw_text = ocr_image(img_path, ocr_engine, lang_ocr, ocr_psm, ocr_oem,
-                                 ocr_crop, strip_border, ocr_scale, binarize,
-                                 tencent_model, debug)
+            if ocr_engine == "http" and img_path.stem in pdf_text_map:
+                raw_text = pdf_text_map.get(img_path.stem, "")
+            else:
+                raw_text = ocr_image(img_path, ocr_engine, lang_ocr, ocr_psm, ocr_oem,
+                                     ocr_crop, strip_border, ocr_scale, binarize,
+                                     tencent_model, debug)
             text = clean_text_for_manhua(raw_text)
             if filter_keywords:
                 text = filter_text_by_keywords(text, filter_keywords)
@@ -1109,7 +1168,9 @@ def build_video(images: List[Path], out_path: Path,
                 enc_preset: str, enc_crf: int,
                 debug: bool, force_ocr: bool,
                 skip_stems: str, skip_silence_sec: float,
-                filter_keywords: Tuple[str, ...]):
+                filter_keywords: Tuple[str, ...],
+                pdf_b64: Optional[str] = None,
+                pdf_page_map: Optional[Dict[str, int]] = None):
     work = out_path.parent / "_ctv_build"
     audio_dir, text_dir, seg_dir = work/"audio", work/"text", work/"seg"
     for d in (work, audio_dir, text_dir, seg_dir): d.mkdir(parents=True, exist_ok=True)
@@ -1121,6 +1182,19 @@ def build_video(images: List[Path], out_path: Path,
 
     print(f"[BOOT] workers={workers} fast_concat={fast_concat} enc_workers={enc_workers} enc_threads={enc_threads}")
     results: Dict[str, Tuple[str,str,float]] = {}
+
+    pdf_page_texts_by_stem: Optional[Dict[str, str]] = None
+    if ocr_engine == "http" and pdf_b64 and pdf_page_map:
+        ocr_url = os.getenv("OCR_API_URL", "http://127.0.0.1:8001/ocr")
+        try:
+            page_texts = ocr_pdf_pages_http(pdf_b64, ocr_url)
+            pdf_page_texts_by_stem = {
+                stem: page_texts.get(page_idx, "")
+                for stem, page_idx in pdf_page_map.items()
+            }
+        except Exception as exc:
+            print(f"[OCR][WARN] failed to OCR PDF via HTTP once: {exc}", file=sys.stderr)
+            pdf_page_texts_by_stem = None
 
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs=[]
@@ -1154,7 +1228,8 @@ def build_video(images: List[Path], out_path: Path,
                 ifly_by_sent, ifly_pause_ms,
                 str(audio_dir), str(text_dir),
                 on_empty, pad_silence, debug, force_ocr,
-                filter_keywords
+                filter_keywords,
+                pdf_page_texts_by_stem
             ))
         for f in as_completed(futs):
             img_path, text_path, audio_path, dur = f.result()
@@ -1341,6 +1416,7 @@ def main():
     temp_ctx: Optional[tempfile.TemporaryDirectory] = None
     pdf_source: Optional[Path] = None
     pdf_candidates: List[Path] = []
+    pdf_page_map: Dict[str, int] = {}
     try:
         try:
             prep_result = prepare_images(input_path)
@@ -1349,6 +1425,7 @@ def main():
             temp_ctx = prep_result.temp_ctx
             pdf_source = prep_result.pdf_source
             pdf_candidates = prep_result.pdf_candidates
+            pdf_page_map = prep_result.pdf_page_map
         except FileNotFoundError:
             print(f"图片目录不存在：{input_path}", file=sys.stderr)
             sys.exit(1)
@@ -1376,6 +1453,14 @@ def main():
                 print(f">>> 已从目录中的 PDF 载入 {len(images)} 页：{pdf_source.name}")
             else:
                 print(f">>> 已从 PDF 载入 {len(images)} 页：{pdf_source.name}")
+
+        pdf_b64_value: Optional[str] = None
+        if pdf_source is not None:
+            try:
+                pdf_b64_value = base64.b64encode(pdf_source.read_bytes()).decode("utf-8")
+            except Exception as exc:
+                print(f"[WARN] 无法读取 PDF 原始数据用于 OCR：{exc}", file=sys.stderr)
+                pdf_b64_value = None
 
         out_path = Path(args.out).expanduser().resolve()
 
@@ -1591,6 +1676,8 @@ def main():
             debug=args.debug, force_ocr=args.force_ocr,
             skip_stems=skip_stems_value, skip_silence_sec=skip_silence_value,
             filter_keywords=filter_keywords_tuple,
+            pdf_b64=pdf_b64_value,
+            pdf_page_map=pdf_page_map,
         )
     finally:
         if temp_ctx is not None:
