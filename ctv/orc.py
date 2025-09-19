@@ -13,6 +13,7 @@ GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
     pip install -U fastapi uvicorn pillow numpy
     pip install paddleocr>=3.0.0
     pip install "paddlepaddle-gpu==2.6.1" -f https://www.paddlepaddle.org.cn/whl/cu121.html
+- 当 OCR_LANG 选择中文模型时会自动启用繁体->简体转换，可用 OCR_T2S=0 强制关闭，也可用 OCR_T2S=1 强制开启
 """
 
 import base64, io, os, sys, time, json
@@ -65,6 +66,7 @@ DET_MAX_SIDE = int(os.getenv("OCR_DET_LIMIT_SIDE", "960"))
 REC_BATCH    = int(os.getenv("OCR_REC_BATCH", "32"))
 # 强制设备（仅用于日志提示）：gpu / cpu（实际设备由 use_gpu & 环境决定）
 PREF_DEV     = os.getenv("OCR_DEVICE", "gpu").lower()
+# 繁->简转换（缺省对中文模型自动开启，OCR_T2S=0/1 可强制关闭/开启）
 # 识别语言（参考 https://github.com/PaddlePaddle/PaddleOCR/blob/release/3.0/doc/doc_ch/recognition_language.md ）
 def _normalize_lang_code(lang: str) -> Tuple[str, Optional[str]]:
     """兼容常见写法，将语言代码规整到 PaddleOCR 支持的形式"""
@@ -112,8 +114,27 @@ if OCR_LANG_ALIAS:
 else:
     print(f"[CONFIG] PaddleOCR lang={OCR_LANG}", file=sys.stderr, flush=True)
 
+
+def _parse_env_toggle(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized or normalized == "auto":
+        return None
+    if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+        return False
+    return None
+
+
 _T2S_CONVERTER = None
-_OPENCC_T2S_ENABLED = OCR_LANG == "chinese_cht"
+_t2s_override = _parse_env_toggle(os.getenv("OCR_T2S"))
+_lang_is_chinese = OCR_LANG == "ch" or OCR_LANG.startswith("chinese")
+_OPENCC_T2S_ENABLED = (
+    _t2s_override if _t2s_override is not None else _lang_is_chinese
+)
+
 if _OPENCC_T2S_ENABLED:
     try:
         from opencc import OpenCC  # type: ignore
@@ -142,6 +163,39 @@ if _OPENCC_T2S_ENABLED:
                 flush=True,
             )
             _OPENCC_T2S_ENABLED = False
+
+if _T2S_CONVERTER is not None:
+    if _t2s_override is None:
+        print(
+            f"[CONFIG] Simplified logging enabled automatically for lang={OCR_LANG}.",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "[CONFIG] Simplified logging enabled via OCR_T2S toggle.",
+            file=sys.stderr,
+            flush=True,
+        )
+else:
+    if _t2s_override is False:
+        print(
+            "[CONFIG] Simplified logging disabled via OCR_T2S toggle.",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif not _lang_is_chinese:
+        print(
+            "[CONFIG] Simplified logging disabled (non-Chinese model).",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            "[CONFIG] Simplified logging unavailable (converter missing).",
+            file=sys.stderr,
+            flush=True,
+        )
 
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
@@ -420,9 +474,12 @@ def do_ocr(req: OcrReq):
             entry = parsed_entries[idx]
             raw_text = entry["raw_text"]
             simplified_text = raw_text
-            if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
+            if _T2S_CONVERTER is not None:
                 try:
-                    simplified_text = _T2S_CONVERTER(raw_text)
+                    converted_text = _T2S_CONVERTER(raw_text)
+                    if converted_text is None:
+                        converted_text = raw_text
+                    simplified_text = converted_text
                 except Exception as exc:  # pragma: no cover
                     print(
                         f"[REC][WARN] T2S convert failed: {exc}",
