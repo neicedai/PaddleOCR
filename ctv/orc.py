@@ -66,9 +66,51 @@ REC_BATCH    = int(os.getenv("OCR_REC_BATCH", "32"))
 # 强制设备（仅用于日志提示）：gpu / cpu（实际设备由 use_gpu & 环境决定）
 PREF_DEV     = os.getenv("OCR_DEVICE", "gpu").lower()
 # 识别语言（参考 https://github.com/PaddlePaddle/PaddleOCR/blob/release/3.0/doc/doc_ch/recognition_language.md ）
-OCR_LANG     = os.getenv("OCR_LANG", "ch").strip() or "ch"
+def _normalize_lang_code(lang: str) -> Tuple[str, Optional[str]]:
+    """兼容常见写法，将语言代码规整到 PaddleOCR 支持的形式"""
 
-print(f"[CONFIG] PaddleOCR lang={OCR_LANG}", file=sys.stderr, flush=True)
+    normalized = lang.strip().lower()
+    if not normalized:
+        return "ch", None
+
+    alias = {
+        "zh-cn": "ch",
+        "zh_cn": "ch",
+        "zh-hans": "ch",
+        "zh_hans": "ch",
+        "chs": "ch",
+        "simplified": "ch",
+        "zh-tw": "chinese_cht",
+        "zh_tw": "chinese_cht",
+        "zh-hk": "chinese_cht",
+        "zh_hk": "chinese_cht",
+        "zh-hant": "chinese_cht",
+        "zh_hant": "chinese_cht",
+        "cht": "chinese_cht",
+        "ch_tra": "chinese_cht",
+        "traditional": "chinese_cht",
+        "chinese_traditional": "chinese_cht",
+    }
+
+    mapped = alias.get(normalized, normalized)
+    if mapped != normalized:
+        return mapped, mapped
+    if normalized != lang:
+        return normalized, normalized
+    return normalized, None
+
+
+OCR_LANG_RAW = os.getenv("OCR_LANG", "ch")
+OCR_LANG, OCR_LANG_ALIAS = _normalize_lang_code(OCR_LANG_RAW)
+
+if OCR_LANG_ALIAS:
+    print(
+        f"[CONFIG] PaddleOCR lang={OCR_LANG_RAW} -> {OCR_LANG}",
+        file=sys.stderr,
+        flush=True,
+    )
+else:
+    print(f"[CONFIG] PaddleOCR lang={OCR_LANG}", file=sys.stderr, flush=True)
 
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
@@ -242,6 +284,7 @@ def do_ocr(req: OcrReq):
                 for idx, text in enumerate(texts):
                     if not text or not text.strip():
                         continue
+                    text_clean = text.strip()
                     score = float(scores[idx]) if idx < len(scores) else 0.0
                     box = None
                     if isinstance(boxes, (list, tuple)) and idx < len(boxes):
@@ -254,7 +297,12 @@ def do_ocr(req: OcrReq):
                         box = boxes[idx]
                     if box is not None:
                         box = np.asarray(box).tolist()
-                    lines.append({"text": text.strip(), "score": score, "box": box})
+                    print(
+                        f"[REC] text='{text_clean}' score={score:.4f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    lines.append({"text": text_clean, "score": score, "box": box})
         return OcrResp(ok=True, lines=[OcrLine(**l) for l in lines])
     except Exception as e:
         err = str(e)
