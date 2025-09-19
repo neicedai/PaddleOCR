@@ -65,6 +65,10 @@ DET_MAX_SIDE = int(os.getenv("OCR_DET_LIMIT_SIDE", "960"))
 REC_BATCH    = int(os.getenv("OCR_REC_BATCH", "32"))
 # 强制设备（仅用于日志提示）：gpu / cpu（实际设备由 use_gpu & 环境决定）
 PREF_DEV     = os.getenv("OCR_DEVICE", "gpu").lower()
+# 识别语言（参考 https://github.com/PaddlePaddle/PaddleOCR/blob/release/3.0/doc/doc_ch/recognition_language.md ）
+OCR_LANG     = os.getenv("OCR_LANG", "ch").strip() or "ch"
+
+print(f"[CONFIG] PaddleOCR lang={OCR_LANG}", file=sys.stderr, flush=True)
 
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
@@ -75,7 +79,7 @@ def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
             gpu_device = "gpu" if PREF_DEV == "auto" else PREF_DEV
             print(f"[INIT] Try GPU (device={gpu_device})...", file=sys.stderr, flush=True)
             ocr = PaddleOCR(
-                lang="ch",
+                lang=OCR_LANG,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=USE_CLS,
@@ -97,7 +101,7 @@ def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
     # 回退 CPU
     print("[INIT] Fallback to CPU (device=cpu)...", file=sys.stderr, flush=True)
     ocr = PaddleOCR(
-        lang="ch",
+        lang=OCR_LANG,
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=USE_CLS,
@@ -157,6 +161,7 @@ def version():
             "cls": USE_CLS,
             "det_limit_side_len": DET_MAX_SIDE,
             "rec_batch_num": REC_BATCH,
+            "lang": OCR_LANG,
         }
     except Exception:
         return {
@@ -164,7 +169,8 @@ def version():
             "paddlepaddle": "unknown",
             "device": "gpu" if USING_GPU else "cpu",
             "use_gpu": USING_GPU,
-            "cls": USE_CLS
+            "cls": USE_CLS,
+            "lang": OCR_LANG,
         }
 
 def _pdf_bytes_to_image_first_page(raw: bytes) -> Tuple[Image.Image, int]:
