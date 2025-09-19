@@ -112,6 +112,37 @@ if OCR_LANG_ALIAS:
 else:
     print(f"[CONFIG] PaddleOCR lang={OCR_LANG}", file=sys.stderr, flush=True)
 
+_T2S_CONVERTER = None
+_OPENCC_T2S_ENABLED = OCR_LANG == "chinese_cht"
+if _OPENCC_T2S_ENABLED:
+    try:
+        from opencc import OpenCC  # type: ignore
+
+        _T2S_CONVERTER = OpenCC("t2s").convert
+        print(
+            "[CONFIG] Traditional Chinese output will be converted to Simplified via opencc.",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:  # pragma: no cover - optional dependency
+        try:
+            from zhconv import convert  # type: ignore
+
+            _T2S_CONVERTER = lambda text: convert(text, "zh-hans")
+            print(
+                "[CONFIG] Traditional Chinese output will be converted to Simplified via zhconv.",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc2:  # pragma: no cover - optional dependency
+            print(
+                "[CONFIG][WARN] No T2S converter available (opencc error: "
+                f"{exc}; zhconv error: {exc2}). Traditional text will remain unchanged.",
+                file=sys.stderr,
+                flush=True,
+            )
+            _OPENCC_T2S_ENABLED = False
+
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
     """优先 GPU 初始化；失败时（如 cuDNN 缺失）自动回退到 CPU，除非 GPU_STRICT=1"""
@@ -285,6 +316,15 @@ def do_ocr(req: OcrReq):
                     if not text or not text.strip():
                         continue
                     text_clean = text.strip()
+                    if _OPENCC_T2S_ENABLED and _T2S_CONVERTER is not None:
+                        try:
+                            text_clean = _T2S_CONVERTER(text_clean)
+                        except Exception as exc:  # pragma: no cover - conversion failure shouldn't break OCR
+                            print(
+                                f"[REC][WARN] T2S convert failed: {exc}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                     score = float(scores[idx]) if idx < len(scores) else 0.0
                     box = None
                     if isinstance(boxes, (list, tuple)) and idx < len(boxes):
