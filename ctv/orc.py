@@ -206,7 +206,14 @@ ocr, USING_GPU = init_ocr_prefer_gpu()
 app = FastAPI(title="Local OCR Service (GPU-first, PaddleOCR 3.x)")
 
 class OcrReq(BaseModel):
+    """HTTP OCR 请求体.
+
+    ``page_index`` 为可选的 1-based 页码；当客户端将其设置为 ``1`` 时，
+    服务会跳过底部聚类逻辑，以完整保留封面页。
+    """
+
     image_b64: str  # 支持纯 base64 或 dataURL（data:image/...;base64,xxxx）
+    page_index: Optional[int] = None
 
 class OcrLine(BaseModel):
     text: str
@@ -400,7 +407,14 @@ def do_ocr(req: OcrReq):
                     })
 
         selected_indices: Optional[List[int]] = None
-        if parsed_entries:
+        is_cover_page = req.page_index == 1 if req.page_index is not None else False
+        if is_cover_page:
+            print(
+                f"[CROP] page_index={req.page_index} -> cover detected, use full-page mode",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif parsed_entries:
             selected_indices = _cluster_bottom_text_entries(box_entries, arr.shape[0])
             if selected_indices:
                 print(

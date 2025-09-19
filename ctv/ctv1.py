@@ -345,11 +345,16 @@ def ocr_text_tencent(img: Image.Image, secret_id: str, secret_key: str,
     text_lines = [d.DetectedText for d in resp.TextDetections]
     return "\n".join(text_lines).strip()
 
-def ocr_text_http(img: Image.Image, url: str) -> str:
+def ocr_text_http(img: Image.Image, url: str, page_index: Optional[int] = None) -> str:
     buf = BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=95)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    payload = {"image_b64": img_b64}
+    payload: Dict[str, Any] = {"image_b64": img_b64}
+    if page_index is not None:
+        try:
+            payload["page_index"] = int(page_index)
+        except (TypeError, ValueError):
+            pass
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -413,7 +418,8 @@ def ocr_image(image_path: Path,
               lang: str, psm: int, oem: int,
               crop_box: Optional[Tuple[float,float,float,float]],
               strip_border: float, scale: float, binarize: bool,
-              tencent_model: str, debug: bool=False) -> str:
+              tencent_model: str, debug: bool=False,
+              page_index: Optional[int] = None) -> str:
     img = Image.open(image_path)
     img = preprocess_for_ocr(img, crop_box, strip_border, scale, binarize)
     if engine == "rapidocr":
@@ -431,7 +437,7 @@ def ocr_image(image_path: Path,
         text = ocr_text_tencent(img, sid, skey, region=region, model=tencent_model)
     elif engine == "http":
         url = os.getenv("OCR_API_URL", "http://127.0.0.1:8001/ocr")
-        text = ocr_text_http(img, url)
+        text = ocr_text_http(img, url, page_index=page_index)
     else:
         raise ValueError(f"未知 ocr-engine: {engine}")
     if debug:
@@ -860,6 +866,7 @@ def save_audio_iflytek_from_sentences(sentences: List[str],
 
 # ---------------- 并行 worker：OCR+TTS ----------------
 def worker_process_one(img_path_str: str,
+                       page_index: Optional[int],
                        ocr_engine: str, lang_ocr: str, ocr_psm: int, ocr_oem: int,
                        ocr_crop: Optional[Tuple[float,float,float,float]],
                        strip_border: float, ocr_scale: float, binarize: bool,
@@ -933,7 +940,7 @@ def worker_process_one(img_path_str: str,
             else:
                 raw_text = ocr_image(img_path, ocr_engine, lang_ocr, ocr_psm, ocr_oem,
                                      ocr_crop, strip_border, ocr_scale, binarize,
-                                     tencent_model, debug)
+                                     tencent_model, debug, page_index=page_index)
             text = clean_text_for_manhua(raw_text)
             if filter_keywords:
                 text = filter_text_by_keywords(text, filter_keywords)
@@ -1198,9 +1205,9 @@ def build_video(images: List[Path], out_path: Path,
 
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs=[]
-        for img in images:
+        for page_index, img in enumerate(images, start=1):
             futs.append(ex.submit(
-                worker_process_one, str(img),
+                worker_process_one, str(img), page_index,
                 ocr_engine, lang_ocr, ocr_psm, ocr_oem,
                 ocr_crop, strip_border, ocr_scale, binarize,
                 tencent_model,
