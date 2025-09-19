@@ -16,7 +16,7 @@ GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
 """
 
 import base64, io, os, sys, time, json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI
@@ -167,11 +167,40 @@ def version():
             "cls": USE_CLS
         }
 
+def _pdf_bytes_to_image_first_page(raw: bytes) -> Tuple[Image.Image, int]:
+    import fitz  # type: ignore
+
+    doc = fitz.open(stream=raw, filetype="pdf")
+    try:
+        total_pages = doc.page_count or 0
+        if total_pages <= 0:
+            raise ValueError("PDF 文件没有可用页面")
+        page = doc.load_page(0)
+        pix = page.get_pixmap()
+        if pix.alpha:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        img_bytes = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return img, total_pages
+    finally:
+        doc.close()
+
+
 def _read_image_from_b64(b64: str) -> Image.Image:
     # 兼容 dataURL
     if b64.strip().lower().startswith("data:"):
         b64 = b64.split(",", 1)[1]
     raw = base64.b64decode(b64)
+    header = raw.lstrip()
+    if header.startswith(b"%PDF"):
+        try:
+            img, total_pages = _pdf_bytes_to_image_first_page(raw)
+        except ImportError as exc:
+            raise RuntimeError("处理 PDF 需要先安装 PyMuPDF：pip install PyMuPDF") from exc
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        print(f"[REQ] PDF base64 输入 -> 第 1 页 (共 {total_pages} 页)", file=sys.stderr, flush=True)
+        return img
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 @app.post("/ocr", response_model=OcrResp)
