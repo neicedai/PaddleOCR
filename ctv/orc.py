@@ -5,7 +5,8 @@ GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
 - 优先使用 GPU（device="gpu"），若 cuDNN/驱动不可用会自动回退到 CPU（可用 OCR_GPU_STRICT=1 禁止回退）
 - 预热：启动时做一次小图推理以加载模型，避免首个请求卡顿
 - 路由：
-    POST /ocr      { "image_b64": "<base64或dataURL>" } -> { ok, lines:[{text, score, box}], error? }
+    POST /ocr      { "image_b64": "<base64或dataURL>", "target_script"?:"auto|simplified|traditional" }
+                  -> { ok, lines:[{text, score, box}], error? }
     GET  /healthz  -> { ok: true }
     GET  /version  -> { paddleocr, paddlepaddle, device, use_gpu, cls }
 - 依赖：fastapi uvicorn pillow numpy paddleocr（以及已装好的 paddlepaddle-gpu 3.x + cuDNN8）
@@ -17,7 +18,7 @@ GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
 """
 
 import base64, io, os, sys, time, json
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Literal
 
 import numpy as np
 from fastapi import FastAPI
@@ -264,10 +265,17 @@ class OcrReq(BaseModel):
 
     ``page_index`` 为可选的 1-based 页码；当客户端将其设置为 ``1`` 时，
     服务会跳过底部聚类逻辑，以完整保留封面页。
+
+    ``target_script`` 控制返回文本的脚本风格：
+
+    - ``"auto"``（默认）会在检测到繁体时尝试转换成简体；若无差异则保持原文；
+    - ``"simplified"`` 始终尝试繁转简；
+    - ``"traditional"`` 保留原始识别结果。
     """
 
     image_b64: str  # 支持纯 base64 或 dataURL（data:image/...;base64,xxxx）
     page_index: Optional[int] = None
+    target_script: Literal["auto", "simplified", "traditional"] = "auto"
 
 class OcrLine(BaseModel):
     text: str
@@ -401,6 +409,13 @@ def do_ocr(req: OcrReq):
         img = _read_image_from_b64(req.image_b64)
         arr = np.array(img)  # HWC, RGB
 
+        target_script = req.target_script or "auto"
+        print(
+            f"[REQ] target_script={target_script} | converter={'yes' if _T2S_CONVERTER else 'no'}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         t0 = time.time()
         result = ocr.predict(arr, use_textline_orientation=USE_CLS)
         dt = time.time() - t0
@@ -473,13 +488,21 @@ def do_ocr(req: OcrReq):
         for idx in indices_to_keep:
             entry = parsed_entries[idx]
             raw_text = entry["raw_text"]
-            simplified_text = raw_text
-            if _T2S_CONVERTER is not None:
+            final_text = raw_text
+            if target_script == "traditional":
+                pass
+            elif _T2S_CONVERTER is None:
+                if target_script == "simplified":
+                    print(
+                        "[REC][SCRIPT] target=simplified but converter unavailable; keep traditional text",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
                 try:
                     converted_text = _T2S_CONVERTER(raw_text)
                     if converted_text is None:
                         converted_text = raw_text
-                    simplified_text = converted_text
                 except Exception as exc:  # pragma: no cover
                     print(
                         f"[REC][WARN] T2S convert failed: {exc}",
@@ -487,17 +510,37 @@ def do_ocr(req: OcrReq):
                         flush=True,
                     )
                 else:
-                    if simplified_text != raw_text:
+                    if target_script == "simplified":
+                        final_text = converted_text
+                        if converted_text != raw_text:
+                            print(
+                                f"[REC][T2S] target=simplified '{raw_text}' -> '{converted_text}'",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[REC][SCRIPT] target=simplified no change for '{raw_text}'",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    elif target_script == "auto" and converted_text != raw_text:
+                        final_text = converted_text
                         print(
-                            f"[REC][T2S] '{raw_text}' -> '{simplified_text}'",
+                            f"[REC][T2S] target=auto '{raw_text}' -> '{converted_text}'",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    elif target_script == "auto":
+                        print(
+                            f"[REC][SCRIPT] target=auto no change for '{raw_text}'",
                             file=sys.stderr,
                             flush=True,
                         )
             score = entry["score"]
             box_arr = entry["box_arr"]
             box = box_arr.tolist() if box_arr is not None else None
-            entry["simplified_text"] = simplified_text
-            final_text = simplified_text
+            entry["final_text"] = final_text
             print(
                 f"[REC] text='{final_text}' score={score:.4f}",
                 file=sys.stderr,

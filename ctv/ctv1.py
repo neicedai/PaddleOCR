@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from io import BytesIO
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Sequence, NamedTuple
+from typing import List, Tuple, Optional, Dict, Any, Sequence, NamedTuple, Literal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -345,7 +345,13 @@ def ocr_text_tencent(img: Image.Image, secret_id: str, secret_key: str,
     text_lines = [d.DetectedText for d in resp.TextDetections]
     return "\n".join(text_lines).strip()
 
-def ocr_text_http(img: Image.Image, url: str, page_index: Optional[int] = None) -> str:
+def ocr_text_http(
+    img: Image.Image,
+    url: str,
+    page_index: Optional[int] = None,
+    target_script: Literal["auto", "simplified", "traditional"] = "auto",
+) -> str:
+    """调用本地 HTTP OCR 服务，并允许选择输出脚本风格."""
     buf = BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=95)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -355,6 +361,11 @@ def ocr_text_http(img: Image.Image, url: str, page_index: Optional[int] = None) 
             payload["page_index"] = int(page_index)
         except (TypeError, ValueError):
             pass
+    normalized_script = (target_script or "auto").strip().lower()
+    if normalized_script not in {"auto", "simplified", "traditional"}:
+        raise ValueError(f"invalid target_script: {target_script}")
+    if normalized_script != "auto":
+        payload["target_script"] = normalized_script
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
     data = r.json()
