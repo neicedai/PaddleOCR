@@ -5,23 +5,26 @@ GPU 优先的本地 OCR HTTP 服务（PaddleOCR 3.x）
 - 优先使用 GPU（device="gpu"），若 cuDNN/驱动不可用会自动回退到 CPU（可用 OCR_GPU_STRICT=1 禁止回退）
 - 预热：启动时做一次小图推理以加载模型，避免首个请求卡顿
 - 路由：
-    POST /ocr      { "image_b64": "<base64或dataURL>" } -> { ok, lines:[{text, score, box}], error? }
+    POST /ocr      { "image_b64"|"file_b64": "<base64或dataURL>", "fileType"?: "pdf"|"image" }
+                  -> { ok, lines:[{text, score, box, page}], error? }
     GET  /healthz  -> { ok: true }
-    GET  /version  -> { paddleocr, paddlepaddle, device, use_gpu, cls }
-- 依赖：fastapi uvicorn pillow numpy paddleocr（以及已装好的 paddlepaddle-gpu 3.x + cuDNN8）
+    GET  /version  -> { paddleocr, paddlepaddle, device, use_gpu, cls, pdf_support, pdf_page_limit }
+- 依赖：fastapi uvicorn pillow numpy pdf2image paddleocr（以及已装好的 paddlepaddle-gpu 3.x + cuDNN8、poppler）
 建议：
-    pip install -U fastapi uvicorn pillow numpy
+    pip install -U fastapi uvicorn pillow numpy pdf2image
     pip install paddleocr>=3.0.0
     pip install "paddlepaddle-gpu==2.6.1" -f https://www.paddlepaddle.org.cn/whl/cu121.html
+    # pdf2image 依赖系统级 poppler，可通过 apt/yum/brew 安装 poppler-utils
 """
 
 import base64, io, os, sys, time, json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, root_validator
 from PIL import Image, ImageDraw
+from pdf2image import convert_from_bytes
 import uvicorn
 
 from paddleocr import PaddleOCR
@@ -129,12 +132,21 @@ ocr, USING_GPU = init_ocr_prefer_gpu()
 app = FastAPI(title="Local OCR Service (GPU-first, PaddleOCR 3.x)")
 
 class OcrReq(BaseModel):
-    image_b64: str  # 支持纯 base64 或 dataURL（data:image/...;base64,xxxx）
+    image_b64: Optional[str] = None  # 兼容旧字段，支持纯 base64 或 dataURL（data:image/...;base64,xxxx）
+    file_b64: Optional[str] = None   # 新字段，便于传除图片以外的文件（如 PDF）
+    fileType: Optional[str] = None   # 可选明确文件类型，pdf/image/...
+
+    @root_validator
+    def _ensure_payload(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        if not (values.get("file_b64") or values.get("image_b64")):
+            raise ValueError("image_b64 或 file_b64 必须提供一个")
+        return values
 
 class OcrLine(BaseModel):
     text: str
     score: float
-    box: List[List[float]]
+    box: Optional[List[List[float]]] = None
+    page: Optional[int] = None
 
 class OcrResp(BaseModel):
     ok: bool
@@ -157,6 +169,8 @@ def version():
             "cls": USE_CLS,
             "det_limit_side_len": DET_MAX_SIDE,
             "rec_batch_num": REC_BATCH,
+            "pdf_support": True,
+            "pdf_page_limit": None,
         }
     except Exception:
         return {
@@ -164,62 +178,165 @@ def version():
             "paddlepaddle": "unknown",
             "device": "gpu" if USING_GPU else "cpu",
             "use_gpu": USING_GPU,
-            "cls": USE_CLS
+            "cls": USE_CLS,
+            "pdf_support": True,
+            "pdf_page_limit": None,
         }
 
-def _read_image_from_b64(b64: str) -> Image.Image:
-    # 兼容 dataURL
-    if b64.strip().lower().startswith("data:"):
-        b64 = b64.split(",", 1)[1]
-    raw = base64.b64decode(b64)
-    return Image.open(io.BytesIO(raw)).convert("RGB")
+def _split_data_url(b64: str) -> Tuple[str, Optional[str]]:
+    """将 dataURL 拆分为 base64 主体与 mime 信息"""
+    data = b64.strip()
+    mime = None
+    if data.lower().startswith("data:"):
+        header, _, payload = data.partition(",")
+        if not payload:
+            raise ValueError("dataURL 缺少数据部分")
+        header = header[5:]  # 去掉 data:
+        if ";" in header:
+            mime = header.split(";", 1)[0].strip().lower()
+        else:
+            mime = header.strip().lower()
+        data = payload
+    return data, mime
+
+
+def _decode_base64_data(b64: str) -> Tuple[bytes, Optional[str]]:
+    """解码 base64（或 dataURL）内容并返回原始字节与可能的 mime"""
+    payload, mime = _split_data_url(b64)
+    try:
+        raw = base64.b64decode(payload, validate=False)
+    except Exception as exc:
+        raise ValueError(f"无法解码 base64 数据: {exc}")
+    return raw, mime
+
+
+def _is_pdf_b64(b64: str, *, decoded_bytes: Optional[bytes] = None, mime_hint: Optional[str] = None) -> bool:
+    """判断 base64 内容是否为 PDF。若提供 decoded_bytes/mime_hint 可避免重复解码"""
+    raw = decoded_bytes
+    mime = mime_hint
+    if raw is None:
+        try:
+            raw, mime = _decode_base64_data(b64)
+        except Exception:
+            return False
+    if mime and mime.lower() == "application/pdf":
+        return True
+    if raw is None:
+        return False
+    return raw.lstrip().startswith(b"%PDF")
+
+
+def _read_image_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> Image.Image:
+    if decoded_bytes is None:
+        decoded_bytes, _ = _decode_base64_data(b64)
+    return Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
+
+
+def _read_pdf_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> List[Image.Image]:
+    if decoded_bytes is None:
+        decoded_bytes, _ = _decode_base64_data(b64)
+    try:
+        return convert_from_bytes(decoded_bytes)
+    except Exception as exc:
+        raise ValueError(f"PDF 转图片失败: {exc}")
+
+
+def _collect_lines(result: Any, page: int) -> List[Dict[str, Any]]:
+    lines: List[Dict[str, Any]] = []
+    if not result:
+        return lines
+    for res in result:
+        data = res
+        if isinstance(data, dict) and "res" in data:
+            data = data["res"]
+        elif hasattr(data, "res"):
+            data = data.res
+        if not hasattr(data, "get") and hasattr(data, "items"):
+            data = dict(data)
+        texts = data.get("rec_texts") or []
+        scores = data.get("rec_scores") or []
+        boxes = (
+            data.get("rec_polys")
+            or data.get("rec_boxes")
+            or data.get("dt_polys")
+            or []
+        )
+
+        for idx, text in enumerate(texts):
+            if not text or not text.strip():
+                continue
+            score = float(scores[idx]) if idx < len(scores) else 0.0
+            box = None
+            if isinstance(boxes, (list, tuple)) and idx < len(boxes):
+                box = boxes[idx]
+            elif (
+                hasattr(boxes, "__getitem__")
+                and hasattr(boxes, "__len__")
+                and idx < len(boxes)
+            ):
+                box = boxes[idx]
+            if box is not None:
+                box = np.asarray(box).tolist()
+            lines.append({"text": text.strip(), "score": score, "box": box, "page": page})
+    return lines
 
 @app.post("/ocr", response_model=OcrResp)
 def do_ocr(req: OcrReq):
     try:
-        img = _read_image_from_b64(req.image_b64)
+        payload = req.file_b64 or req.image_b64
+        assert payload is not None  # root_validator 已保证
+
+        decoded_bytes, mime_hint = _decode_base64_data(payload)
+        declared_type = (req.fileType or "").strip().lower()
+        is_pdf = declared_type == "pdf"
+        if not is_pdf:
+            is_pdf = _is_pdf_b64(payload, decoded_bytes=decoded_bytes, mime_hint=mime_hint)
+
+        if is_pdf:
+            t0 = time.time()
+            try:
+                pages = _read_pdf_from_b64(payload, decoded_bytes=decoded_bytes)
+            except Exception as exc:
+                err = f"PDF 解析失败: {exc}"
+                print(f"[ERR][PDF] {err}", file=sys.stderr, flush=True)
+                return OcrResp(ok=False, lines=[], error=err)
+
+            if not pages:
+                err = "PDF 未解析到任何页面"
+                print(f"[ERR][PDF] {err}", file=sys.stderr, flush=True)
+                return OcrResp(ok=False, lines=[], error=err)
+
+            total_lines: List[Dict[str, Any]] = []
+            for page_idx, page_image in enumerate(pages, start=1):
+                arr = np.array(page_image.convert("RGB"))
+                try:
+                    result = ocr.predict(arr, use_textline_orientation=USE_CLS)
+                except Exception as exc:
+                    err = f"第 {page_idx} 页 OCR 失败: {exc}"
+                    print(f"[ERR][PDF] {err}", file=sys.stderr, flush=True)
+                    return OcrResp(ok=False, lines=[], error=err)
+                total_lines.extend(_collect_lines(result, page_idx))
+
+            dt = time.time() - t0
+            print(
+                f"[REQ] pdf pages={len(pages)} OK in {dt:.2f}s | device={'GPU' if USING_GPU else 'CPU'} | cls={USE_CLS}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return OcrResp(ok=True, lines=[OcrLine(**l) for l in total_lines])
+
+        # 默认按图片处理
+        img = _read_image_from_b64(payload, decoded_bytes=decoded_bytes)
         arr = np.array(img)  # HWC, RGB
         t0 = time.time()
         result = ocr.predict(arr, use_textline_orientation=USE_CLS)
         dt = time.time() - t0
-        print(f"[REQ] one image OK in {dt:.2f}s | device={'GPU' if USING_GPU else 'CPU'} | cls={USE_CLS}",
-              file=sys.stderr, flush=True)
-
-        lines: List[Dict[str, Any]] = []
-        if result:
-            for res in result:
-                data = res
-                if isinstance(data, dict) and "res" in data:
-                    data = data["res"]
-                elif hasattr(data, "res"):
-                    data = data.res
-                if not hasattr(data, "get") and hasattr(data, "items"):
-                    data = dict(data)
-                texts = data.get("rec_texts") or []
-                scores = data.get("rec_scores") or []
-                boxes = (
-                    data.get("rec_polys")
-                    or data.get("rec_boxes")
-                    or data.get("dt_polys")
-                    or []
-                )
-
-                for idx, text in enumerate(texts):
-                    if not text or not text.strip():
-                        continue
-                    score = float(scores[idx]) if idx < len(scores) else 0.0
-                    box = None
-                    if isinstance(boxes, (list, tuple)) and idx < len(boxes):
-                        box = boxes[idx]
-                    elif (
-                        hasattr(boxes, "__getitem__")
-                        and hasattr(boxes, "__len__")
-                        and idx < len(boxes)
-                    ):
-                        box = boxes[idx]
-                    if box is not None:
-                        box = np.asarray(box).tolist()
-                    lines.append({"text": text.strip(), "score": score, "box": box})
+        print(
+            f"[REQ] one image OK in {dt:.2f}s | device={'GPU' if USING_GPU else 'CPU'} | cls={USE_CLS}",
+            file=sys.stderr,
+            flush=True,
+        )
+        lines = _collect_lines(result, 1)
         return OcrResp(ok=True, lines=[OcrLine(**l) for l in lines])
     except Exception as e:
         err = str(e)
