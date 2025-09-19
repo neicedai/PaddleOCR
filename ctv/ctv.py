@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from io import BytesIO
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Sequence, NamedTuple
+from typing import List, Tuple, Optional, Dict, Any, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -75,89 +75,6 @@ def list_images_sorted(images_dir: Path) -> List[Path]:
     files = [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
     files.sort(key=lambda p: natural_key(p.name))
     return files
-
-
-def convert_pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 300) -> Tuple[List[Path], Dict[str, int]]:
-    """Render a PDF file into PNG images stored in *out_dir*.
-
-    Returns the generated image paths sorted by page order along with a mapping
-    from the generated image stem to the page index (1-based).
-    """
-    try:
-        import pypdfium2  # type: ignore
-    except ImportError as exc:  # pragma: no cover - informative error path
-        raise RuntimeError("需要安装 pypdfium2 才能处理 PDF 文件，请执行 `pip install pypdfium2`."
-                           ) from exc
-
-    doc = pypdfium2.PdfDocument(str(pdf_path))
-    images: List[Path] = []
-    page_map: Dict[str, int] = {}
-    # dpi 转换到 Pdfium scale（72 DPI 为 1.0）
-    scale = max(dpi, 72) / 72.0
-    try:
-        for page_index, page in enumerate(doc, start=1):
-            bitmap = page.render(scale=scale)
-            pil_image = bitmap.to_pil()
-            out_path = out_dir / f"{pdf_path.stem}_{page_index:04d}.png"
-            pil_image.save(out_path)
-            pil_image.close()
-            bitmap.close()
-            images.append(out_path)
-            page_map[out_path.stem] = page_index
-    finally:
-        doc.close()
-
-    return images, page_map
-
-
-class PrepareImagesResult(NamedTuple):
-    images_dir: Path
-    images: List[Path]
-    temp_ctx: Optional[tempfile.TemporaryDirectory]
-    pdf_source: Optional[Path]
-    pdf_candidates: List[Path]
-    pdf_page_map: Dict[str, int]
-
-
-def prepare_images(input_path: Path) -> PrepareImagesResult:
-    """Resolve images from *input_path*.
-
-    Returns a :class:`PrepareImagesResult` describing the resolved images, any
-    temporary directory that needs clean-up, and metadata about PDF discovery.
-    Caller is responsible for cleaning up the ``temp_ctx`` (if not ``None``).
-    """
-    if not input_path.exists():
-        raise FileNotFoundError(str(input_path))
-
-    if input_path.is_dir():
-        images = list_images_sorted(input_path)
-        if images:
-            return PrepareImagesResult(input_path, images, None, None, [], {})
-
-        pdf_candidates = [
-            p for p in input_path.iterdir()
-            if p.is_file() and p.suffix.lower() == ".pdf"
-        ]
-        pdf_candidates.sort(key=lambda p: natural_key(p.name))
-        if pdf_candidates:
-            pdf_path = pdf_candidates[0]
-            tmp_ctx = tempfile.TemporaryDirectory(prefix="ctv_pdf_")
-            tmp_dir = Path(tmp_ctx.name)
-            images, page_map = convert_pdf_to_images(pdf_path, tmp_dir)
-            images.sort(key=lambda p: natural_key(p.name))
-            return PrepareImagesResult(tmp_dir, images, tmp_ctx, pdf_path, pdf_candidates, page_map)
-
-        return PrepareImagesResult(input_path, [], None, None, [], {})
-
-    suffix = input_path.suffix.lower()
-    if suffix == ".pdf" and input_path.is_file():
-        tmp_ctx = tempfile.TemporaryDirectory(prefix="ctv_pdf_")
-        tmp_dir = Path(tmp_ctx.name)
-        images, page_map = convert_pdf_to_images(input_path, tmp_dir)
-        images.sort(key=lambda p: natural_key(p.name))
-        return PrepareImagesResult(tmp_dir, images, tmp_ctx, input_path, [input_path], page_map)
-
-    raise ValueError(f"不支持的输入：{input_path}")
 
 def ensure_font(size: int):
     cands = [
@@ -357,56 +274,6 @@ def ocr_text_http(img: Image.Image, url: str) -> str:
         raise RuntimeError(data.get("error", "OCR service error"))
     lines = [l.get("text", "") for l in data.get("lines", []) if l.get("text")]
     return "\n".join(lines).strip()
-
-
-def ocr_pdf_pages_http(pdf_b64: str, url: str) -> Dict[int, str]:
-    payload = {"file_b64": pdf_b64, "fileType": "pdf"}
-    r = requests.post(url, json=payload, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(data.get("error", "OCR service error"))
-
-    page_texts: Dict[int, str] = {}
-    pages_payload = data.get("pages")
-    if isinstance(pages_payload, list):
-        for entry in pages_payload:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                page_idx = int(entry.get("page") or entry.get("pageIndex") or 1)
-            except Exception:
-                page_idx = 1
-            text_val = entry.get("text")
-            if text_val is None:
-                lines_payload = entry.get("lines") or []
-                texts = []
-                for line in lines_payload:
-                    if not isinstance(line, dict):
-                        continue
-                    txt = (line.get("text") or "").strip()
-                    if txt:
-                        texts.append(txt)
-                text_val = "\n".join(texts)
-            page_texts[page_idx] = (text_val or "").strip()
-
-    if not page_texts:
-        grouped: Dict[int, List[str]] = {}
-        for line in data.get("lines", []):
-            if not isinstance(line, dict):
-                continue
-            try:
-                page_idx = int(line.get("page") or 1)
-            except Exception:
-                page_idx = 1
-            txt = (line.get("text") or "").strip()
-            if not txt:
-                continue
-            grouped.setdefault(page_idx, []).append(txt)
-        for page_idx, texts in grouped.items():
-            page_texts[page_idx] = "\n".join(texts).strip()
-
-    return page_texts
 
 def ocr_image(image_path: Path,
               engine: str,
@@ -896,11 +763,9 @@ def worker_process_one(img_path_str: str,
                        ifly_by_sent: bool, ifly_pause_ms: int,
                        audio_dir_str: str, text_dir_str: str,
                        on_empty: str, pad_silence: float, debug: bool, force_ocr: bool,
-                       filter_keywords: Tuple[str, ...],
-                       pdf_page_texts: Optional[Dict[str, str]]):
+                       filter_keywords: Tuple[str, ...]):
     img_path = Path(img_path_str)
     audio_dir, text_dir = Path(audio_dir_str), Path(text_dir_str)
-    pdf_text_map: Dict[str, str] = pdf_page_texts or {}
 
     logs_dir = audio_dir.parent / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -928,12 +793,9 @@ def worker_process_one(img_path_str: str,
     need_ocr = force_ocr or (not text_path.exists()) or (text_path.read_text(encoding="utf-8", errors="ignore").strip() == "")
     if need_ocr:
         try:
-            if ocr_engine == "http" and img_path.stem in pdf_text_map:
-                raw_text = pdf_text_map.get(img_path.stem, "")
-            else:
-                raw_text = ocr_image(img_path, ocr_engine, lang_ocr, ocr_psm, ocr_oem,
-                                     ocr_crop, strip_border, ocr_scale, binarize,
-                                     tencent_model, debug)
+            raw_text = ocr_image(img_path, ocr_engine, lang_ocr, ocr_psm, ocr_oem,
+                                 ocr_crop, strip_border, ocr_scale, binarize,
+                                 tencent_model, debug)
             text = clean_text_for_manhua(raw_text)
             if filter_keywords:
                 text = filter_text_by_keywords(text, filter_keywords)
@@ -1168,9 +1030,7 @@ def build_video(images: List[Path], out_path: Path,
                 enc_preset: str, enc_crf: int,
                 debug: bool, force_ocr: bool,
                 skip_stems: str, skip_silence_sec: float,
-                filter_keywords: Tuple[str, ...],
-                pdf_b64: Optional[str] = None,
-                pdf_page_map: Optional[Dict[str, int]] = None):
+                filter_keywords: Tuple[str, ...]):
     work = out_path.parent / "_ctv_build"
     audio_dir, text_dir, seg_dir = work/"audio", work/"text", work/"seg"
     for d in (work, audio_dir, text_dir, seg_dir): d.mkdir(parents=True, exist_ok=True)
@@ -1182,19 +1042,6 @@ def build_video(images: List[Path], out_path: Path,
 
     print(f"[BOOT] workers={workers} fast_concat={fast_concat} enc_workers={enc_workers} enc_threads={enc_threads}")
     results: Dict[str, Tuple[str,str,float]] = {}
-
-    pdf_page_texts_by_stem: Optional[Dict[str, str]] = None
-    if ocr_engine == "http" and pdf_b64 and pdf_page_map:
-        ocr_url = os.getenv("OCR_API_URL", "http://127.0.0.1:8001/ocr")
-        try:
-            page_texts = ocr_pdf_pages_http(pdf_b64, ocr_url)
-            pdf_page_texts_by_stem = {
-                stem: page_texts.get(page_idx, "")
-                for stem, page_idx in pdf_page_map.items()
-            }
-        except Exception as exc:
-            print(f"[OCR][WARN] failed to OCR PDF via HTTP once: {exc}", file=sys.stderr)
-            pdf_page_texts_by_stem = None
 
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs=[]
@@ -1228,8 +1075,7 @@ def build_video(images: List[Path], out_path: Path,
                 ifly_by_sent, ifly_pause_ms,
                 str(audio_dir), str(text_dir),
                 on_empty, pad_silence, debug, force_ocr,
-                filter_keywords,
-                pdf_page_texts_by_stem
+                filter_keywords
             ))
         for f in as_completed(futs):
             img_path, text_path, audio_path, dur = f.result()
@@ -1412,276 +1258,226 @@ def main():
             path = (env_base_dir / path).resolve()
         return str(path)
 
-    input_path = Path(args.images_dir).expanduser().resolve()
-    temp_ctx: Optional[tempfile.TemporaryDirectory] = None
-    pdf_source: Optional[Path] = None
-    pdf_candidates: List[Path] = []
-    pdf_page_map: Dict[str, int] = {}
-    try:
+    images_dir = Path(args.images_dir).expanduser().resolve()
+    if not images_dir.exists(): print(f"图片目录不存在：{images_dir}", file=sys.stderr); sys.exit(1)
+    images = list_images_sorted(images_dir)
+    if not images: print(f"目录中没有图片：{images_dir}", file=sys.stderr); sys.exit(1)
+    out_path = Path(args.out).expanduser().resolve()
+
+    # 选择 OCR / TTS
+    ocr_engine = pick_engine(args.ocr_engine, "OCR_VENDOR", "tencent",
+                             ["tencent","baidu","rapidocr","tesseract","http"])
+    tts_engine = pick_engine(args.tts_engine, "TTS_VENDOR", "edge",
+                             ["edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts","indextts"])
+    tencent_model = (args.tencent_model or os.getenv("TENCENT_OCR_MODEL","basic")).lower()
+    if tencent_model not in ("basic","accurate"): tencent_model = "basic"
+
+    chatts_url = args.chatts_url or os.getenv("CHATTTS_API_URL")
+    chatts_url = chatts_url.strip() if chatts_url else "http://127.0.0.1:9900/generate_voice"
+    chatts_prompt = args.chatts_prompt or os.getenv("CHATTTS_PROMPT", "[speed_5]")
+    chatts_speaker = args.chatts_speaker or os.getenv("CHATTTS_SPK_EMB")
+    chatts_seed = args.chatts_seed if args.chatts_seed is not None else _maybe_int(os.getenv("CHATTTS_SEED"))
+    chatts_lang = args.chatts_lang or os.getenv("CHATTTS_LANG")
+    chatts_refine = args.chatts_refine or _bool_from(os.getenv("CHATTTS_REFINE"), False)
+    chatts_refine_prompt = args.chatts_refine_prompt or os.getenv("CHATTTS_REFINE_PROMPT")
+    chatts_refine_seed = args.chatts_refine_seed if args.chatts_refine_seed is not None else _maybe_int(os.getenv("CHATTTS_REFINE_SEED"))
+    chatts_normalize = _bool_from(os.getenv("CHATTTS_NORMALIZE"), not args.chatts_no_normalize)
+    chatts_homophone = _bool_from(os.getenv("CHATTTS_HOMOPHONE"), args.chatts_homophone)
+    if args.chatts_timeout is not None:
+        chatts_timeout = args.chatts_timeout
+    else:
+        timeout_env = os.getenv("CHATTTS_TIMEOUT")
         try:
-            prep_result = prepare_images(input_path)
-            images_dir = prep_result.images_dir
-            images = prep_result.images
-            temp_ctx = prep_result.temp_ctx
-            pdf_source = prep_result.pdf_source
-            pdf_candidates = prep_result.pdf_candidates
-            pdf_page_map = prep_result.pdf_page_map
-        except FileNotFoundError:
-            print(f"图片目录不存在：{input_path}", file=sys.stderr)
-            sys.exit(1)
-        except RuntimeError as exc:
-            print(f"PDF 转图片失败：{exc}", file=sys.stderr)
-            sys.exit(1)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
+            chatts_timeout = float(timeout_env) if timeout_env is not None else 120.0
+        except (TypeError, ValueError):
+            chatts_timeout = 120.0
+
+    def ensure_env_vars(keys: List[str], context: str):
+        missing = [k for k in keys if not os.getenv(k)]
+        if missing:
+            msg = f"缺少 {context} 所需的环境变量：{', '.join(missing)}（请在 .env 或环境中配置）"
+            print(msg, file=sys.stderr)
             sys.exit(1)
 
-        if not images:
-            if pdf_source is not None:
-                if input_path.is_dir():
-                    print(f"目录中的 PDF 文件中没有可用的页面：{pdf_source}", file=sys.stderr)
-                else:
-                    print(f"PDF 文件中没有可用的页面：{pdf_source}", file=sys.stderr)
-            elif input_path.is_dir() and not pdf_candidates:
-                print(f"目录中没有图片也没有 PDF 文件：{input_path}", file=sys.stderr)
-            else:
-                print(f"目录中没有图片：{input_path}", file=sys.stderr)
+    print(">>> .env file:", os.path.abspath(args.env_file))
+    ocr_msg = f">>> OCR engine chosen: {ocr_engine}"
+    if ocr_engine == "tencent":
+        ocr_msg += f" (tencent_model={tencent_model})"
+        ensure_env_vars(["TENCENT_SECRET_ID", "TENCENT_SECRET_KEY"], "腾讯 OCR")
+    elif ocr_engine == "baidu":
+        ensure_env_vars(["BAIDU_OCR_AK", "BAIDU_OCR_SK"], "百度 OCR")
+    print(ocr_msg)
+
+    print(">>> TTS engine chosen:", tts_engine)
+    if tts_engine == "azure":
+        ensure_env_vars(["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION"], "Azure 语音合成")
+    elif tts_engine == "elevenlabs":
+        ensure_env_vars(["ELEVEN_API_KEY"], "ElevenLabs 语音合成")
+    elif tts_engine == "chatts" and not chatts_url:
+        print("缺少 ChatTTS API URL（请通过 --chatts-url 或 CHATTTS_API_URL 指定）", file=sys.stderr)
+        sys.exit(1)
+
+    # OCR 裁剪
+    ocr_crop = None
+    if args.ocr_crop:
+        try:
+            x1,y1,x2,y2 = [float(s) for s in args.ocr_crop.split(",")]
+            ocr_crop = (x1,y1,x2,y2)
+        except:
+            print("无效的 --ocr-crop，格式 x1,y1,x2,y2（0~1）", file=sys.stderr); sys.exit(1)
+
+    # TTS 参数（Edge pitch/style 忽略）
+    edge_voice = args.edge_voice or os.getenv("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
+    edge_rate  = args.edge_rate  or os.getenv("EDGE_RATE", "+0%")
+    edge_pitch = args.edge_pitch or os.getenv("EDGE_PITCH", None)
+    edge_style = args.edge_style or os.getenv("EDGE_STYLE", None)
+
+    azure_voice = args.azure_voice or os.getenv("AZURE_VOICE", "zh-CN-XiaoxiaoNeural")
+    azure_rate  = args.azure_rate  or os.getenv("AZURE_RATE", "+0%")
+    azure_pitch = args.azure_pitch or os.getenv("AZURE_PITCH", "0%")
+    azure_style = args.azure_style or os.getenv("AZURE_STYLE", None)
+
+    eleven_voice_id = args.eleven_voice_id or os.getenv("ELEVEN_VOICE_ID", None)
+    if tts_engine == "elevenlabs" and not (eleven_voice_id and eleven_voice_id.strip()):
+        print("缺少 ElevenLabs Voice ID（请通过 --eleven-voice-id 或 ELEVEN_VOICE_ID 提供）", file=sys.stderr)
+        sys.exit(1)
+    voice_lang = args.voice_lang or os.getenv("GTTS_LANG", "zh-CN")
+    voice_name = args.voice_name or os.getenv("PYTTSX3_VOICE", None)
+
+    indextts_emotion = (os.getenv("INDEXTTS_EMOTION") or "neutral").strip().lower()
+    if not indextts_emotion:
+        indextts_emotion = "neutral"
+    indextts_url = os.getenv("INDEXTTS_API_URL", "http://127.0.0.1:8000/tts")
+    indextts_prompt_wav = resolve_env_path(os.getenv("INDEXTTS_PROMPT_WAV"))
+    indextts_emo_wav = resolve_env_path(_env_for_emotion("INDEXTTS_EMO_WAV", indextts_emotion))
+    indextts_emo_text_raw = _env_for_emotion("INDEXTTS_EMO_TEXT", indextts_emotion)
+    indextts_emo_text = indextts_emo_text_raw.strip() if indextts_emo_text_raw else None
+    indextts_use_emo_text = _bool_from(_env_for_emotion("INDEXTTS_USE_EMO_TEXT", indextts_emotion), False)
+    emo_alpha_val = _env_for_emotion("INDEXTTS_EMO_ALPHA", indextts_emotion)
+    indextts_emo_alpha = _maybe_float(emo_alpha_val) if emo_alpha_val is not None else None
+    if indextts_emo_alpha is None:
+        indextts_emo_alpha = 1.0
+    indextts_emo_vector_json_raw = _env_for_emotion("INDEXTTS_EMO_VECTOR_JSON", indextts_emotion)
+    indextts_emo_vector_json = indextts_emo_vector_json_raw.strip() if indextts_emo_vector_json_raw else None
+    indextts_use_random = _bool_from(_env_for_emotion("INDEXTTS_USE_RANDOM", indextts_emotion), False)
+    interval_env = _env_for_emotion("INDEXTTS_INTERVAL_SILENCE", indextts_emotion)
+    indextts_interval_silence = _maybe_int(interval_env)
+    if indextts_interval_silence is None:
+        indextts_interval_silence = 200
+    max_tokens_env = _env_for_emotion("INDEXTTS_MAX_TEXT_TOKENS", indextts_emotion)
+    indextts_max_text_tokens = _maybe_int(max_tokens_env)
+    temperature_env = _env_for_emotion("INDEXTTS_TEMPERATURE", indextts_emotion)
+    indextts_temperature = _maybe_float(temperature_env)
+    top_p_env = _env_for_emotion("INDEXTTS_TOP_P", indextts_emotion)
+    indextts_top_p = _maybe_float(top_p_env)
+    top_k_env = _env_for_emotion("INDEXTTS_TOP_K", indextts_emotion)
+    indextts_top_k = _maybe_int(top_k_env)
+    rep_env = _env_for_emotion("INDEXTTS_REPETITION_PENALTY", indextts_emotion)
+    indextts_repetition_penalty = _maybe_float(rep_env)
+    max_mel_env = _env_for_emotion("INDEXTTS_MAX_MEL_TOKENS", indextts_emotion)
+    indextts_max_mel_tokens = _maybe_int(max_mel_env)
+    timeout_env = _env_for_emotion("INDEXTTS_TIMEOUT", indextts_emotion)
+    indextts_timeout = _maybe_float(timeout_env)
+    if indextts_timeout is None or indextts_timeout <= 0:
+        indextts_timeout = 180.0
+
+    # iflytek 优先取命令行，否则取 .env
+    ifly_ws_url = args.ifly_ws_url or os.getenv("XFYUN_WS_URL")
+    ifly_app_id = args.ifly_app_id or os.getenv("XFYUN_APPID")
+    ifly_key    = args.ifly_api_key or os.getenv("XFYUN_API_KEY")
+    ifly_secret = args.ifly_api_secret or os.getenv("XFYUN_API_SECRET")
+    if tts_engine == "iflytek":
+        missing_cfg = []
+        if not (ifly_ws_url and ifly_ws_url.strip()):
+            missing_cfg.append("XFYUN_WS_URL 或 --ifly-ws-url")
+        if not (ifly_app_id and ifly_app_id.strip()):
+            missing_cfg.append("XFYUN_APPID 或 --ifly-app-id")
+        if not (ifly_key and ifly_key.strip()):
+            missing_cfg.append("XFYUN_API_KEY 或 --ifly-api-key")
+        if not (ifly_secret and ifly_secret.strip()):
+            missing_cfg.append("XFYUN_API_SECRET 或 --ifly-api-secret")
+        if missing_cfg:
+            print("讯飞私有域缺少配置：" + ", ".join(missing_cfg), file=sys.stderr)
             sys.exit(1)
+    if tts_engine == "indextts":
+        if not indextts_prompt_wav:
+            print("缺少 IndexTTS 参考音频（请通过 INDEXTTS_PROMPT_WAV 设置）", file=sys.stderr)
+            sys.exit(1)
+        prompt_path = Path(indextts_prompt_wav)
+        if not prompt_path.exists():
+            print(f"IndexTTS 参考音频不存在：{prompt_path}", file=sys.stderr)
+            sys.exit(1)
+        if indextts_emo_wav:
+            emo_path = Path(indextts_emo_wav)
+            if not emo_path.exists():
+                print(f"IndexTTS 情感参考音频不存在：{emo_path}", file=sys.stderr)
+                sys.exit(1)
 
-        if pdf_source is not None:
-            if input_path.is_dir():
-                print(f">>> 已从目录中的 PDF 载入 {len(images)} 页：{pdf_source.name}")
-            else:
-                print(f">>> 已从 PDF 载入 {len(images)} 页：{pdf_source.name}")
+    skip_stems_value = args.skip_stems
+    if skip_stems_value == default_skip_stems:
+        skip_stems_value = os.getenv("SKIP_STEMS", default_skip_stems)
 
-        pdf_b64_value: Optional[str] = None
-        if pdf_source is not None:
+    skip_silence_value = args.skip_silence_sec
+    if skip_silence_value == default_skip_silence:
+        skip_silence_env = os.getenv("SKIP_SILENCE_SEC")
+        if skip_silence_env is not None and skip_silence_env.strip():
             try:
-                pdf_b64_value = base64.b64encode(pdf_source.read_bytes()).decode("utf-8")
-            except Exception as exc:
-                print(f"[WARN] 无法读取 PDF 原始数据用于 OCR：{exc}", file=sys.stderr)
-                pdf_b64_value = None
+                skip_silence_value = float(skip_silence_env)
+            except ValueError:
+                print(f"无效的 SKIP_SILENCE_SEC：{skip_silence_env}，已回退为 {default_skip_silence}", file=sys.stderr)
+                skip_silence_value = default_skip_silence
 
-        out_path = Path(args.out).expanduser().resolve()
+    filter_keywords_value = args.filter_keywords
+    if filter_keywords_value == default_filter_keywords:
+        filter_keywords_value = os.getenv("FILTER_KEYWORDS", default_filter_keywords)
+    filter_keywords_tuple = tuple([kw.strip() for kw in filter_keywords_value.replace("\n", ",").split(",") if kw.strip()])
 
-        # 选择 OCR / TTS
-        ocr_engine = pick_engine(args.ocr_engine, "OCR_VENDOR", "tencent",
-                                 ["tencent","baidu","rapidocr","tesseract","http"])
-        tts_engine = pick_engine(args.tts_engine, "TTS_VENDOR", "edge",
-                                 ["edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts","indextts"])
-        tencent_model = (args.tencent_model or os.getenv("TENCENT_OCR_MODEL","basic")).lower()
-        if tencent_model not in ("basic","accurate"): tencent_model = "basic"
-
-        chatts_url = args.chatts_url or os.getenv("CHATTTS_API_URL")
-        chatts_url = chatts_url.strip() if chatts_url else "http://127.0.0.1:9900/generate_voice"
-        chatts_prompt = args.chatts_prompt or os.getenv("CHATTTS_PROMPT", "[speed_5]")
-        chatts_speaker = args.chatts_speaker or os.getenv("CHATTTS_SPK_EMB")
-        chatts_seed = args.chatts_seed if args.chatts_seed is not None else _maybe_int(os.getenv("CHATTTS_SEED"))
-        chatts_lang = args.chatts_lang or os.getenv("CHATTTS_LANG")
-        chatts_refine = args.chatts_refine or _bool_from(os.getenv("CHATTTS_REFINE"), False)
-        chatts_refine_prompt = args.chatts_refine_prompt or os.getenv("CHATTTS_REFINE_PROMPT")
-        chatts_refine_seed = args.chatts_refine_seed if args.chatts_refine_seed is not None else _maybe_int(os.getenv("CHATTTS_REFINE_SEED"))
-        chatts_normalize = _bool_from(os.getenv("CHATTTS_NORMALIZE"), not args.chatts_no_normalize)
-        chatts_homophone = _bool_from(os.getenv("CHATTTS_HOMOPHONE"), args.chatts_homophone)
-        if args.chatts_timeout is not None:
-            chatts_timeout = args.chatts_timeout
-        else:
-            timeout_env = os.getenv("CHATTTS_TIMEOUT")
-            try:
-                chatts_timeout = float(timeout_env) if timeout_env is not None else 120.0
-            except (TypeError, ValueError):
-                chatts_timeout = 120.0
-
-        def ensure_env_vars(keys: List[str], context: str):
-            missing = [k for k in keys if not os.getenv(k)]
-            if missing:
-                msg = f"缺少 {context} 所需的环境变量：{', '.join(missing)}（请在 .env 或环境中配置）"
-                print(msg, file=sys.stderr)
-                sys.exit(1)
-
-        print(">>> .env file:", os.path.abspath(args.env_file))
-        ocr_msg = f">>> OCR engine chosen: {ocr_engine}"
-        if ocr_engine == "tencent":
-            ocr_msg += f" (tencent_model={tencent_model})"
-            ensure_env_vars(["TENCENT_SECRET_ID", "TENCENT_SECRET_KEY"], "腾讯 OCR")
-        elif ocr_engine == "baidu":
-            ensure_env_vars(["BAIDU_OCR_AK", "BAIDU_OCR_SK"], "百度 OCR")
-        print(ocr_msg)
-
-        print(">>> TTS engine chosen:", tts_engine)
-        if tts_engine == "azure":
-            ensure_env_vars(["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION"], "Azure 语音合成")
-        elif tts_engine == "elevenlabs":
-            ensure_env_vars(["ELEVEN_API_KEY"], "ElevenLabs 语音合成")
-        elif tts_engine == "chatts" and not chatts_url:
-            print("缺少 ChatTTS API URL（请通过 --chatts-url 或 CHATTTS_API_URL 指定）", file=sys.stderr)
-            sys.exit(1)
-
-        # OCR 裁剪
-        ocr_crop = None
-        if args.ocr_crop:
-            try:
-                x1,y1,x2,y2 = [float(s) for s in args.ocr_crop.split(",")]
-                ocr_crop = (x1,y1,x2,y2)
-            except:
-                print("无效的 --ocr-crop，格式 x1,y1,x2,y2（0~1）", file=sys.stderr); sys.exit(1)
-
-        # TTS 参数（Edge pitch/style 忽略）
-        edge_voice = args.edge_voice or os.getenv("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
-        edge_rate  = args.edge_rate  or os.getenv("EDGE_RATE", "+0%")
-        edge_pitch = args.edge_pitch or os.getenv("EDGE_PITCH", None)
-        edge_style = args.edge_style or os.getenv("EDGE_STYLE", None)
-
-        azure_voice = args.azure_voice or os.getenv("AZURE_VOICE", "zh-CN-XiaoxiaoNeural")
-        azure_rate  = args.azure_rate  or os.getenv("AZURE_RATE", "+0%")
-        azure_pitch = args.azure_pitch or os.getenv("AZURE_PITCH", "0%")
-        azure_style = args.azure_style or os.getenv("AZURE_STYLE", None)
-
-        eleven_voice_id = args.eleven_voice_id or os.getenv("ELEVEN_VOICE_ID", None)
-        if tts_engine == "elevenlabs" and not (eleven_voice_id and eleven_voice_id.strip()):
-            print("缺少 ElevenLabs Voice ID（请通过 --eleven-voice-id 或 ELEVEN_VOICE_ID 提供）", file=sys.stderr)
-            sys.exit(1)
-        voice_lang = args.voice_lang or os.getenv("GTTS_LANG", "zh-CN")
-        voice_name = args.voice_name or os.getenv("PYTTSX3_VOICE", None)
-
-        indextts_emotion = (os.getenv("INDEXTTS_EMOTION") or "neutral").strip().lower()
-        if not indextts_emotion:
-            indextts_emotion = "neutral"
-        indextts_url = os.getenv("INDEXTTS_API_URL", "http://127.0.0.1:8000/tts")
-        indextts_prompt_wav = resolve_env_path(os.getenv("INDEXTTS_PROMPT_WAV"))
-        indextts_emo_wav = resolve_env_path(_env_for_emotion("INDEXTTS_EMO_WAV", indextts_emotion))
-        indextts_emo_text_raw = _env_for_emotion("INDEXTTS_EMO_TEXT", indextts_emotion)
-        indextts_emo_text = indextts_emo_text_raw.strip() if indextts_emo_text_raw else None
-        indextts_use_emo_text = _bool_from(_env_for_emotion("INDEXTTS_USE_EMO_TEXT", indextts_emotion), False)
-        emo_alpha_val = _env_for_emotion("INDEXTTS_EMO_ALPHA", indextts_emotion)
-        indextts_emo_alpha = _maybe_float(emo_alpha_val) if emo_alpha_val is not None else None
-        if indextts_emo_alpha is None:
-            indextts_emo_alpha = 1.0
-        indextts_emo_vector_json_raw = _env_for_emotion("INDEXTTS_EMO_VECTOR_JSON", indextts_emotion)
-        indextts_emo_vector_json = indextts_emo_vector_json_raw.strip() if indextts_emo_vector_json_raw else None
-        indextts_use_random = _bool_from(_env_for_emotion("INDEXTTS_USE_RANDOM", indextts_emotion), False)
-        interval_env = _env_for_emotion("INDEXTTS_INTERVAL_SILENCE", indextts_emotion)
-        indextts_interval_silence = _maybe_int(interval_env)
-        if indextts_interval_silence is None:
-            indextts_interval_silence = 200
-        max_tokens_env = _env_for_emotion("INDEXTTS_MAX_TEXT_TOKENS", indextts_emotion)
-        indextts_max_text_tokens = _maybe_int(max_tokens_env)
-        temperature_env = _env_for_emotion("INDEXTTS_TEMPERATURE", indextts_emotion)
-        indextts_temperature = _maybe_float(temperature_env)
-        top_p_env = _env_for_emotion("INDEXTTS_TOP_P", indextts_emotion)
-        indextts_top_p = _maybe_float(top_p_env)
-        top_k_env = _env_for_emotion("INDEXTTS_TOP_K", indextts_emotion)
-        indextts_top_k = _maybe_int(top_k_env)
-        rep_env = _env_for_emotion("INDEXTTS_REPETITION_PENALTY", indextts_emotion)
-        indextts_repetition_penalty = _maybe_float(rep_env)
-        max_mel_env = _env_for_emotion("INDEXTTS_MAX_MEL_TOKENS", indextts_emotion)
-        indextts_max_mel_tokens = _maybe_int(max_mel_env)
-        timeout_env = _env_for_emotion("INDEXTTS_TIMEOUT", indextts_emotion)
-        indextts_timeout = _maybe_float(timeout_env)
-        if indextts_timeout is None or indextts_timeout <= 0:
-            indextts_timeout = 180.0
-
-        # iflytek 优先取命令行，否则取 .env
-        ifly_ws_url = args.ifly_ws_url or os.getenv("XFYUN_WS_URL")
-        ifly_app_id = args.ifly_app_id or os.getenv("XFYUN_APPID")
-        ifly_key    = args.ifly_api_key or os.getenv("XFYUN_API_KEY")
-        ifly_secret = args.ifly_api_secret or os.getenv("XFYUN_API_SECRET")
-        if tts_engine == "iflytek":
-            missing_cfg = []
-            if not (ifly_ws_url and ifly_ws_url.strip()):
-                missing_cfg.append("XFYUN_WS_URL 或 --ifly-ws-url")
-            if not (ifly_app_id and ifly_app_id.strip()):
-                missing_cfg.append("XFYUN_APPID 或 --ifly-app-id")
-            if not (ifly_key and ifly_key.strip()):
-                missing_cfg.append("XFYUN_API_KEY 或 --ifly-api-key")
-            if not (ifly_secret and ifly_secret.strip()):
-                missing_cfg.append("XFYUN_API_SECRET 或 --ifly-api-secret")
-            if missing_cfg:
-                print("讯飞私有域缺少配置：" + ", ".join(missing_cfg), file=sys.stderr)
-                sys.exit(1)
-        if tts_engine == "indextts":
-            if not indextts_prompt_wav:
-                print("缺少 IndexTTS 参考音频（请通过 INDEXTTS_PROMPT_WAV 设置）", file=sys.stderr)
-                sys.exit(1)
-            prompt_path = Path(indextts_prompt_wav)
-            if not prompt_path.exists():
-                print(f"IndexTTS 参考音频不存在：{prompt_path}", file=sys.stderr)
-                sys.exit(1)
-            if indextts_emo_wav:
-                emo_path = Path(indextts_emo_wav)
-                if not emo_path.exists():
-                    print(f"IndexTTS 情感参考音频不存在：{emo_path}", file=sys.stderr)
-                    sys.exit(1)
-
-        skip_stems_value = args.skip_stems
-        if skip_stems_value == default_skip_stems:
-            skip_stems_value = os.getenv("SKIP_STEMS", default_skip_stems)
-
-        skip_silence_value = args.skip_silence_sec
-        if skip_silence_value == default_skip_silence:
-            skip_silence_env = os.getenv("SKIP_SILENCE_SEC")
-            if skip_silence_env is not None and skip_silence_env.strip():
-                try:
-                    skip_silence_value = float(skip_silence_env)
-                except ValueError:
-                    print(f"无效的 SKIP_SILENCE_SEC：{skip_silence_env}，已回退为 {default_skip_silence}", file=sys.stderr)
-                    skip_silence_value = default_skip_silence
-
-        filter_keywords_value = args.filter_keywords
-        if filter_keywords_value == default_filter_keywords:
-            filter_keywords_value = os.getenv("FILTER_KEYWORDS", default_filter_keywords)
-        filter_keywords_tuple = tuple([kw.strip() for kw in filter_keywords_value.replace("\n", ",").split(",") if kw.strip()])
-        build_video(
-            images=images,
-            out_path=out_path,
-            ocr_engine=ocr_engine,
-            lang_ocr=args.lang,
-            ocr_psm=args.ocr_psm,
-            ocr_oem=args.ocr_oem,
-            ocr_crop=ocr_crop,
-            strip_border=args.strip_border,
-            ocr_scale=args.scale,
-            binarize=not args.no_binarize,
-            tencent_model=tencent_model,
-            tts_engine=tts_engine,
-            edge_voice=edge_voice, edge_rate=edge_rate, edge_pitch=edge_pitch, edge_style=edge_style,
-            azure_voice=azure_voice, azure_rate=azure_rate, azure_pitch=azure_pitch, azure_style=azure_style,
-            eleven_voice_id=eleven_voice_id,
-            voice_lang=voice_lang, voice_name=voice_name,
-            chatts_url=chatts_url, chatts_prompt=chatts_prompt, chatts_speaker=chatts_speaker,
-            chatts_seed=chatts_seed, chatts_lang=chatts_lang,
-            chatts_refine=chatts_refine, chatts_refine_prompt=chatts_refine_prompt, chatts_refine_seed=chatts_refine_seed,
-            chatts_normalize=chatts_normalize, chatts_homophone=chatts_homophone, chatts_timeout=chatts_timeout,
-            indextts_url=indextts_url, indextts_prompt_wav=indextts_prompt_wav,
-            indextts_emo_wav=indextts_emo_wav, indextts_emo_text=indextts_emo_text,
-            indextts_use_emo_text=indextts_use_emo_text, indextts_emo_alpha=indextts_emo_alpha,
-            indextts_emo_vector_json=indextts_emo_vector_json, indextts_use_random=indextts_use_random,
-            indextts_interval_silence=indextts_interval_silence, indextts_max_text_tokens=indextts_max_text_tokens,
-            indextts_temperature=indextts_temperature, indextts_top_p=indextts_top_p,
-            indextts_top_k=indextts_top_k, indextts_repetition_penalty=indextts_repetition_penalty,
-            indextts_max_mel_tokens=indextts_max_mel_tokens, indextts_timeout=indextts_timeout,
-            ifly_ws_url=ifly_ws_url, ifly_app_id=ifly_app_id, ifly_key=ifly_key, ifly_secret=ifly_secret,
-            ifly_vcn=args.ifly_vcn, ifly_speed=args.ifly_speed, ifly_volume=args.ifly_volume, ifly_pitch=args.ifly_pitch,
-            ifly_encoding=args.ifly_encoding, ifly_sr=args.ifly_sr, ifly_channels=args.ifly_channels, ifly_bit_depth=args.ifly_bit_depth,
-            ifly_oral_level=args.ifly_oral_level, ifly_stop_split=args.ifly_stop_split, ifly_remain=args.ifly_remain,
-            ifly_by_sent=args.ifly_by_sent, ifly_pause_ms=args.ifly_pause_ms,
-            subtitle=(args.subtitle=="on"),
-            fade=args.fade, fps=args.fps,
-            target_width=args.target_width, target_height=args.target_height,
-            pad_silence=args.pad_silence, on_empty=args.on_empty,
-            workers=args.workers,
-            fast_concat=(args.fast_concat=="on"),
-            enc_workers=args.enc_workers, enc_threads=args.enc_threads,
-            enc_preset=args.enc_preset, enc_crf=args.enc_crf,
-            debug=args.debug, force_ocr=args.force_ocr,
-            skip_stems=skip_stems_value, skip_silence_sec=skip_silence_value,
-            filter_keywords=filter_keywords_tuple,
-            pdf_b64=pdf_b64_value,
-            pdf_page_map=pdf_page_map,
-        )
-    finally:
-        if temp_ctx is not None:
-            temp_ctx.cleanup()
+    build_video(
+        images=images,
+        out_path=out_path,
+        ocr_engine=ocr_engine,
+        lang_ocr=args.lang,
+        ocr_psm=args.ocr_psm,
+        ocr_oem=args.ocr_oem,
+        ocr_crop=ocr_crop,
+        strip_border=args.strip_border,
+        ocr_scale=args.scale,
+        binarize=not args.no_binarize,
+        tencent_model=tencent_model,
+        tts_engine=tts_engine,
+        edge_voice=edge_voice, edge_rate=edge_rate, edge_pitch=edge_pitch, edge_style=edge_style,
+        azure_voice=azure_voice, azure_rate=azure_rate, azure_pitch=azure_pitch, azure_style=azure_style,
+        eleven_voice_id=eleven_voice_id,
+        voice_lang=voice_lang, voice_name=voice_name,
+        chatts_url=chatts_url, chatts_prompt=chatts_prompt, chatts_speaker=chatts_speaker,
+        chatts_seed=chatts_seed, chatts_lang=chatts_lang,
+        chatts_refine=chatts_refine, chatts_refine_prompt=chatts_refine_prompt, chatts_refine_seed=chatts_refine_seed,
+        chatts_normalize=chatts_normalize, chatts_homophone=chatts_homophone, chatts_timeout=chatts_timeout,
+        indextts_url=indextts_url, indextts_prompt_wav=indextts_prompt_wav,
+        indextts_emo_wav=indextts_emo_wav, indextts_emo_text=indextts_emo_text,
+        indextts_use_emo_text=indextts_use_emo_text, indextts_emo_alpha=indextts_emo_alpha,
+        indextts_emo_vector_json=indextts_emo_vector_json, indextts_use_random=indextts_use_random,
+        indextts_interval_silence=indextts_interval_silence, indextts_max_text_tokens=indextts_max_text_tokens,
+        indextts_temperature=indextts_temperature, indextts_top_p=indextts_top_p,
+        indextts_top_k=indextts_top_k, indextts_repetition_penalty=indextts_repetition_penalty,
+        indextts_max_mel_tokens=indextts_max_mel_tokens, indextts_timeout=indextts_timeout,
+        ifly_ws_url=ifly_ws_url, ifly_app_id=ifly_app_id, ifly_key=ifly_key, ifly_secret=ifly_secret,
+        ifly_vcn=args.ifly_vcn, ifly_speed=args.ifly_speed, ifly_volume=args.ifly_volume, ifly_pitch=args.ifly_pitch,
+        ifly_encoding=args.ifly_encoding, ifly_sr=args.ifly_sr, ifly_channels=args.ifly_channels, ifly_bit_depth=args.ifly_bit_depth,
+        ifly_oral_level=args.ifly_oral_level, ifly_stop_split=args.ifly_stop_split, ifly_remain=args.ifly_remain,
+        ifly_by_sent=args.ifly_by_sent, ifly_pause_ms=args.ifly_pause_ms,
+        subtitle=(args.subtitle=="on"),
+        fade=args.fade, fps=args.fps,
+        target_width=args.target_width, target_height=args.target_height,
+        pad_silence=args.pad_silence, on_empty=args.on_empty,
+        workers=args.workers,
+        fast_concat=(args.fast_concat=="on"),
+        enc_workers=args.enc_workers, enc_threads=args.enc_threads,
+        enc_preset=args.enc_preset, enc_crf=args.enc_crf,
+        debug=args.debug, force_ocr=args.force_ocr,
+        skip_stems=skip_stems_value, skip_silence_sec=skip_silence_value,
+        filter_keywords=filter_keywords_tuple,
+    )
 
 if __name__ == "__main__":
     main()
