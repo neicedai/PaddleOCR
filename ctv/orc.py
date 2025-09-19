@@ -297,7 +297,7 @@ def _read_pdf_from_b64(b64: str, *, decoded_bytes: Optional[bytes] = None) -> Li
             errors.append("pypdfium2: no pages rendered")
 
     try:
-        return convert_from_bytes(decoded_bytes)
+        return convert_from_bytes(decoded_bytes, dpi=PDF_RENDER_DPI)
     except Exception as exc:
         errors.append(f"pdf2image: {exc}")
         raise ValueError("PDF 转图片失败: " + "; ".join(errors))
