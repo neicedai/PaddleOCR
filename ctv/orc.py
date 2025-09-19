@@ -22,7 +22,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI
-from pydantic import BaseModel, root_validator
+from pydantic import BaseModel, Field, root_validator
 from PIL import Image, ImageDraw
 from pdf2image import convert_from_bytes
 import uvicorn
@@ -148,9 +148,16 @@ class OcrLine(BaseModel):
     box: Optional[List[List[float]]] = None
     page: Optional[int] = None
 
+class OcrPage(BaseModel):
+    page: int
+    lines: List[OcrLine] = Field(default_factory=list)
+    text: str = ""
+
+
 class OcrResp(BaseModel):
     ok: bool
-    lines: List[OcrLine] = []
+    lines: List[OcrLine] = Field(default_factory=list)
+    pages: List[OcrPage] = Field(default_factory=list)
     error: Optional[str] = None
 
 @app.get("/healthz")
@@ -306,7 +313,8 @@ def do_ocr(req: OcrReq):
                 print(f"[ERR][PDF] {err}", file=sys.stderr, flush=True)
                 return OcrResp(ok=False, lines=[], error=err)
 
-            total_lines: List[Dict[str, Any]] = []
+            total_lines: List[OcrLine] = []
+            pages_resp: List[OcrPage] = []
             for page_idx, page_image in enumerate(pages, start=1):
                 arr = np.array(page_image.convert("RGB"))
                 try:
@@ -315,7 +323,11 @@ def do_ocr(req: OcrReq):
                     err = f"第 {page_idx} 页 OCR 失败: {exc}"
                     print(f"[ERR][PDF] {err}", file=sys.stderr, flush=True)
                     return OcrResp(ok=False, lines=[], error=err)
-                total_lines.extend(_collect_lines(result, page_idx))
+                raw_lines = _collect_lines(result, page_idx)
+                ocr_lines = [OcrLine(**l) for l in raw_lines]
+                total_lines.extend(ocr_lines)
+                page_text = "\n".join([line.text for line in ocr_lines if line.text]).strip()
+                pages_resp.append(OcrPage(page=page_idx, lines=ocr_lines, text=page_text))
 
             dt = time.time() - t0
             print(
@@ -323,7 +335,7 @@ def do_ocr(req: OcrReq):
                 file=sys.stderr,
                 flush=True,
             )
-            return OcrResp(ok=True, lines=[OcrLine(**l) for l in total_lines])
+            return OcrResp(ok=True, lines=total_lines, pages=pages_resp)
 
         # 默认按图片处理
         img = _read_image_from_b64(payload, decoded_bytes=decoded_bytes)
@@ -337,7 +349,9 @@ def do_ocr(req: OcrReq):
             flush=True,
         )
         lines = _collect_lines(result, 1)
-        return OcrResp(ok=True, lines=[OcrLine(**l) for l in lines])
+        ocr_lines = [OcrLine(**l) for l in lines]
+        page_text = "\n".join([line.text for line in ocr_lines if line.text]).strip()
+        return OcrResp(ok=True, lines=ocr_lines, pages=[OcrPage(page=1, lines=ocr_lines, text=page_text)])
     except Exception as e:
         err = str(e)
         print(f"[ERR] {err}", file=sys.stderr, flush=True)
