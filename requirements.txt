@@ -4,6 +4,7 @@ pyclipper
 lmdb
 tqdm
 numpy
+pdf2image
 rapidfuzz
 opencv-python
 opencv-contrib-python
