@@ -201,12 +201,12 @@ else:
             file=sys.stderr,
             flush=True,
         )
-else:
-    print(
-        "[CONFIG] Simplified logging unavailable (converter missing).",
-        file=sys.stderr,
-        flush=True,
-    )
+    else:
+        print(
+            "[CONFIG] Simplified logging unavailable (converter missing).",
+            file=sys.stderr,
+            flush=True,
+        )
 
 print(
     f"[CONFIG] recognition score threshold={REC_SCORE_MIN}",
