@@ -65,6 +65,16 @@ PORT         = int(os.getenv("OCR_PORT", "8001"))
 DET_MAX_SIDE = int(os.getenv("OCR_DET_LIMIT_SIDE", "960"))
 # 识别批大小，CPU/GPU 可调 16~64 观察吞吐
 REC_BATCH    = int(os.getenv("OCR_REC_BATCH", "32"))
+# 识别结果分数阈值（低于该分数的文本将被丢弃，<=0 表示不过滤）
+try:
+    REC_SCORE_MIN = float(os.getenv("OCR_REC_SCORE_MIN", "0.3"))
+except ValueError:
+    print(
+        "[CONFIG][WARN] Invalid OCR_REC_SCORE_MIN value, fallback to 0.3",
+        file=sys.stderr,
+        flush=True,
+    )
+    REC_SCORE_MIN = 0.3
 # 强制设备（仅用于日志提示）：gpu / cpu（实际设备由 use_gpu & 环境决定）
 PREF_DEV     = os.getenv("OCR_DEVICE", "gpu").lower()
 # 繁->简转换（缺省对中文模型自动开启，OCR_T2S=0/1 可强制关闭/开启）
@@ -191,12 +201,18 @@ else:
             file=sys.stderr,
             flush=True,
         )
-    else:
-        print(
-            "[CONFIG] Simplified logging unavailable (converter missing).",
-            file=sys.stderr,
-            flush=True,
-        )
+else:
+    print(
+        "[CONFIG] Simplified logging unavailable (converter missing).",
+        file=sys.stderr,
+        flush=True,
+    )
+
+print(
+    f"[CONFIG] recognition score threshold={REC_SCORE_MIN}",
+    file=sys.stderr,
+    flush=True,
+)
 
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
@@ -447,6 +463,13 @@ def do_ocr(req: OcrReq):
                         continue
                     original_text = text.strip()
                     score = float(scores[idx]) if idx < len(scores) else 0.0
+                    if REC_SCORE_MIN > 0 and score < REC_SCORE_MIN:
+                        print(
+                            f"[REC][SKIP] text='{original_text}' score={score:.4f} < {REC_SCORE_MIN}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     box_raw = None
                     if isinstance(boxes, (list, tuple)) and idx < len(boxes):
                         box_raw = boxes[idx]
