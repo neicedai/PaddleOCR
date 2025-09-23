@@ -214,6 +214,12 @@ print(
     flush=True,
 )
 
+print(
+    f"[CONFIG] recognition score threshold={REC_SCORE_MIN}",
+    file=sys.stderr,
+    flush=True,
+)
+
 # ================== 初始化与回退 ==================
 def init_ocr_prefer_gpu() -> (PaddleOCR, bool):
     """优先 GPU 初始化；失败时（如 cuDNN 缺失）自动回退到 CPU，除非 GPU_STRICT=1"""
