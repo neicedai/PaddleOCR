@@ -139,6 +139,18 @@ def _parse_env_toggle(value: Optional[str]) -> Optional[bool]:
     return None
 
 
+# 是否仅聚焦底部文本区域（默认关闭，可通过 OCR_BOTTOM_FOCUS=1 开启）
+_BOTTOM_FOCUS_OVERRIDE = _parse_env_toggle(os.getenv("OCR_BOTTOM_FOCUS"))
+BOTTOM_FOCUS_ENABLED = _BOTTOM_FOCUS_OVERRIDE is True
+
+if _BOTTOM_FOCUS_OVERRIDE is not None:
+    print(
+        f"[CONFIG] Bottom text focus {'enabled' if BOTTOM_FOCUS_ENABLED else 'disabled'} via OCR_BOTTOM_FOCUS.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 _T2S_CONVERTER = None
 _t2s_override = _parse_env_toggle(os.getenv("OCR_T2S"))
 _lang_is_chinese = OCR_LANG == "ch" or OCR_LANG.startswith("chinese")
@@ -503,7 +515,7 @@ def do_ocr(req: OcrReq):
                 file=sys.stderr,
                 flush=True,
             )
-        elif parsed_entries:
+        elif parsed_entries and BOTTOM_FOCUS_ENABLED:
             selected_indices = _cluster_bottom_text_entries(box_entries, arr.shape[0])
             if selected_indices:
                 print(
