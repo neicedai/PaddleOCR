@@ -139,11 +139,17 @@ def _parse_env_toggle(value: Optional[str]) -> Optional[bool]:
     return None
 
 
-# 是否仅聚焦底部文本区域（默认关闭，可通过 OCR_BOTTOM_FOCUS=1 开启）
+# 是否仅聚焦底部文本区域（默认开启，可通过 OCR_BOTTOM_FOCUS=0 关闭）
 _BOTTOM_FOCUS_OVERRIDE = _parse_env_toggle(os.getenv("OCR_BOTTOM_FOCUS"))
-BOTTOM_FOCUS_ENABLED = _BOTTOM_FOCUS_OVERRIDE is True
-
-if _BOTTOM_FOCUS_OVERRIDE is not None:
+if _BOTTOM_FOCUS_OVERRIDE is None:
+    BOTTOM_FOCUS_ENABLED = True
+    print(
+        "[CONFIG] Bottom text focus enabled by default (set OCR_BOTTOM_FOCUS=0 to disable).",
+        file=sys.stderr,
+        flush=True,
+    )
+else:
+    BOTTOM_FOCUS_ENABLED = _BOTTOM_FOCUS_OVERRIDE
     print(
         f"[CONFIG] Bottom text focus {'enabled' if BOTTOM_FOCUS_ENABLED else 'disabled'} via OCR_BOTTOM_FOCUS.",
         file=sys.stderr,
