@@ -206,25 +206,30 @@ if _T2S_CONVERTER is not None:
             file=sys.stderr,
             flush=True,
         )
+elif _t2s_override is False:
+    print(
+        "[CONFIG] Simplified logging disabled via OCR_T2S toggle.",
+        file=sys.stderr,
+        flush=True,
+    )
+elif not _lang_is_chinese:
+    print(
+        "[CONFIG] Simplified logging disabled (non-Chinese model).",
+        file=sys.stderr,
+        flush=True,
+    )
 else:
-    if _t2s_override is False:
-        print(
-            "[CONFIG] Simplified logging disabled via OCR_T2S toggle.",
-            file=sys.stderr,
-            flush=True,
-        )
-    elif not _lang_is_chinese:
-        print(
-            "[CONFIG] Simplified logging disabled (non-Chinese model).",
-            file=sys.stderr,
-            flush=True,
-        )
-    else:
-        print(
-            "[CONFIG] Simplified logging unavailable (converter missing).",
-            file=sys.stderr,
-            flush=True,
-        )
+    print(
+        "[CONFIG] Simplified logging unavailable (converter missing).",
+        file=sys.stderr,
+        flush=True,
+    )
+
+print(
+    f"[CONFIG] recognition score threshold={REC_SCORE_MIN}",
+    file=sys.stderr,
+    flush=True,
+)
 
 print(
     f"[CONFIG] recognition score threshold={REC_SCORE_MIN}",
